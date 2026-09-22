@@ -30,3 +30,4 @@ redisdata/
 # --- Logs / local artifacts ---
 *.log
 /tmp/
+dump.rdb
