@@ -116,3 +116,49 @@ the bottom.
   restarted it. Result: `XLEN`=60, `XPENDING`=0, Postgres row count=60 —
   every event sent across the whole session landed exactly once, with
   zero loss and zero duplication across two separate hard kills.
+
+## 2026-09-23 — Simulator
+
+- Added `services/simulator`: test equipment (docs/PLAN.md, problem
+  framing — not part of the product), a fake fleet of drone/rover/quad
+  assets that POSTs to the real ingest API over real HTTP, with four
+  independently-configurable fault switches (`SIM_DUPLICATE_RATE`,
+  `SIM_OUT_OF_ORDER_RATE`, `SIM_BAD_DATA_RATE`, `SIM_SILENCE_RATE`, each
+  a 0.0–1.0 probability per tick, 0 = off) plus `SIM_FORCE_SILENT_ASSET_IDS`
+  for a deliberate, noise-free way to demo one asset going offline.
+- Split into pure, testable pieces on purpose: `assets.py` (per-tick
+  physics — bound-safe, contract-valid by construction), `faults.py`
+  (a seeded `FaultInjector` deciding *whether* to duplicate/reorder/
+  corrupt/go silent, and *how* to corrupt — 8 corruption kinds, each
+  checked against the real `TelemetryEvent` to guarantee it's a 422, not
+  a lucky pass), `scheduler.py` (`plan_tick`: pure function turning one
+  tick into "what to actually send", no I/O), `client.py` (the only part
+  that touches the network). `main.py`'s run loop is thin glue over
+  these — one asyncio task per asset, same SIGTERM/SIGINT graceful-
+  shutdown pattern as the worker.
+- Out-of-order is implemented as hold-then-release: a reorder roll holds
+  the current (newer-seq) event and sends it *before* releasing the
+  previously-held (older-seq) one next tick — so it's genuinely delivered
+  out of order on the wire, not just delayed.
+- A single `SIM_SEED` derives per-asset child seeds for both the physics
+  and the fault rolls, so a whole run's exact fault sequence is
+  reproducible.
+- 27 unit tests (physics bounds/contract-validity, fault-rate accuracy
+  via seeded sampling, every corruption kind independently proven to
+  fail `TelemetryEvent` validation, scheduler decisions for all four
+  switches) plus 4 integration tests driving the scheduler + HTTP client
+  against a real in-process ingest API and real Redis (proving the
+  actual wire behavior, not just the pure logic) — 85 passing total
+  across the repo.
+- Live end-to-end demo: ran real `uvicorn` + `worker.main` +
+  `simulator.main` processes together for 12s with all four switches
+  turned up (30% duplicate/out-of-order/bad-data, 10% random silence,
+  rover-01 forced fully silent) — 89 events attempted, 60 accepted, 29
+  rejected 422 and never enqueued; worker outcomes were 33
+  `stored_and_advanced`, 16 `duplicate_ignored`, 11 `stored_but_stale`
+  (33+16+11 = 60, matching Redis `XLEN`); `telemetry_events` ended at 44
+  rows (33+11 — duplicates correctly created zero extra rows);
+  `asset_state.latest_seq` for drone-01 and quad-01 matched their true
+  highest seq despite the reordering; rover-01 never appeared anywhere,
+  as forced. No bugs found this step — the worker/API code paths this
+  exercises were already covered by the previous two steps' fixes.

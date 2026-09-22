@@ -1,0 +1,25 @@
+[project]
+name = "blackbox-simulator"
+version = "0.1.0"
+description = "Fake fleet telemetry generator for the blackbox backend (test equipment, not part of the product — docs/PLAN.md)"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+]
+# telemetry-contract (../../libs/telemetry_contract) is a workspace-local
+# package, installed separately rather than declared here — see
+# services/api/pyproject.toml for why.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["simulator*"]
