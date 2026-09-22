@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Docker / data volumes ---
+pgdata/
+redisdata/
+*.pid
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Logs / local artifacts ---
+*.log
+/tmp/
