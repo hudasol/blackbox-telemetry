@@ -162,3 +162,65 @@ the bottom.
   highest seq despite the reordering; rover-01 never appeared anywhere,
   as forced. No bugs found this step — the worker/API code paths this
   exercises were already covered by the previous two steps' fixes.
+
+## 2026-09-23 — Query API + health endpoints
+
+- Added the query router to the existing `api` service (docs/PLAN.md,
+  D4): `GET /api/v1/assets` (all known assets), `GET
+  /api/v1/assets/{id}/latest` (one asset's current snapshot, 404 if
+  unknown), `GET /api/v1/assets/{id}/history?limit=` (bounded raw
+  history, newest first, default 50/max 500 — an asset with no history
+  is an empty 200, not a 404, since that's a valid answer rather than a
+  missing resource). `online` is computed at read time in SQL
+  (`EXTRACT(EPOCH FROM (now() - last_seen_at)) < timeout`), never
+  stored, per D3.
+- Added `GET /health/live` (process up, zero dependency checks — never
+  restart a healthy process over a Redis/Postgres blip) and `GET
+  /health/ready` (pings both Redis and Postgres, 503 if either is
+  unreachable, names which one in the response).
+- api now also holds a Postgres pool (`asyncpg`, alongside the existing
+  Redis client) since query needs it. Created with `min_size=0`
+  deliberately: ingest's Redis dependency and query's Postgres one are
+  independent (D4), so a Postgres outage at startup must not stop this
+  process from accepting telemetry — connections open lazily on first
+  real use instead of eagerly at pool creation.
+- Also redacted credentials out of `redis_url`/`postgres_dsn` before
+  they reach the startup log line (noticed while adding the postgres_dsn
+  log field — the existing redis_url one had the same latent issue).
+- Bug found and fixed while wiring this up (not live-testing yet — just
+  reading my own code back): the global 422 handler hard-coded
+  `"error": "invalid_telemetry_event"` for every validation failure,
+  written back when the only thing that could 422 was a bad ingest body.
+  It's a global exception handler, though, so a bad `?limit=` on the new
+  history endpoint got the same misleading label. Fixed by checking
+  `loc[0] == "body"` to tell an ingest rejection from any other kind;
+  added a regression test.
+- Real bug found live, the same way as the last two steps — running
+  actual processes and hitting them, not just pytest: mid-demo, an
+  unrelated `pytest` run against the same throwaway Redis instance
+  flushed it (its fixtures call `flushdb`), deleting the stream and
+  consumer group out from under the *running* worker. That exposed a
+  real gap, not just a testing mistake: `ensure_consumer_group` only
+  ever ran once, at worker startup, so a `NOGROUP` error (stream/group
+  gone, e.g. a Redis restart without persistence or an operator flush)
+  retried into the bounded backoff forever and never actually recovered,
+  even once Redis was healthy again. Fixed in `worker/main.py`: on a
+  `NOGROUP` `ResponseError` specifically, recreate the consumer group
+  and retry immediately instead of backing off; a genuine "Redis is
+  still down" case falls through to the normal backoff unchanged.
+  Verified with an integration test that runs the real `run()` loop,
+  deletes the stream mid-flight, and confirms a subsequent event still
+  gets stored — and again live, deleting the stream against a live
+  worker and watching it self-heal and pick the next event up.
+- 11 new integration tests for query/health (against real Postgres +
+  Redis, including deliberately-unreachable ones for the two 503 health
+  cases) plus 1 for the consumer-group self-heal — 97 passing total
+  across the repo.
+- Live end-to-end check beyond pytest: ran api + worker + simulator
+  together, confirmed `/health/live` stays 200 with both dependencies
+  reachable, `/health/ready` reports both `ok`, `/api/v1/assets` and
+  `/latest` matched what the worker had just written (including 404 for
+  an asset that was forced silent and so never has a row), `history`
+  returned events newest-first bounded to the requested limit, and the
+  offline timeout correctly flipped `online` to `false` after no events
+  for longer than `ASSET_OFFLINE_TIMEOUT_SECONDS`.

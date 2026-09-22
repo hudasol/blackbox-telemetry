@@ -13,7 +13,7 @@ import logging
 import signal
 
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 
 from .config import get_settings
 from .db import bootstrap_schema, create_pool
@@ -82,6 +82,29 @@ async def run(shutdown_event: asyncio.Event) -> None:
                     )
                 redis_error_attempt = 0
             except RedisError as exc:
+                # NOGROUP means the stream and/or consumer group is gone
+                # out from under us — a Redis restart without persistence,
+                # or an operator flush — even though Redis itself is
+                # reachable. Retrying the same read forever would never
+                # recover on its own; recreate the group (mkstream=True
+                # recreates the stream too) and carry straight on instead
+                # of waiting out a backoff for something re-creating won't
+                # fix by waiting. Found live: docs/PROCESS_LOG.md.
+                if isinstance(exc, ResponseError) and "NOGROUP" in str(exc):
+                    logger.warning(
+                        "worker.consumer_group_missing_recreating",
+                        extra={
+                            "event": "worker.consumer_group_missing_recreating",
+                            "reason": str(exc),
+                        },
+                    )
+                    try:
+                        await ensure_consumer_group(redis)
+                        redis_error_attempt = 0
+                        continue
+                    except RedisError:
+                        pass  # Redis itself is down too — fall through to backoff.
+
                 # A blip talking to Redis itself (not a per-message
                 # Postgres failure, which process_message already handles)
                 # shouldn't kill the worker either — same bounded-backoff
