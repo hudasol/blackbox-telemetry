@@ -26,3 +26,9 @@ HEADING_DEG_MIN = 0.0
 HEADING_DEG_MAX = 360.0
 
 MIN_SEQ = 0
+
+# Redis Streams naming. api (producer) and worker (consumer) must agree on
+# these exactly, so they live here instead of being redefined in each
+# service (see docs/PLAN.md, architecture / decision D5).
+STREAM_NAME = "telemetry.raw"
+CONSUMER_GROUP_NAME = "worker-group"

@@ -31,3 +31,33 @@ the bottom.
   `datetime.now()` assuming that's UTC — the sandbox actually runs in
   UTC+4, so the model correctly rejected it as 4 hours in the future.
   Fixed the test, not the model.
+
+## 2026-09-23 — Ingest API
+
+- Added `services/api`: `POST /api/v1/telemetry` validates against the
+  shared contract, then `XADD`s to Redis (`telemetry.raw`, name now in
+  `telemetry_contract.constants` alongside `worker-group`, so worker
+  can't drift on either name).
+- Structured JSON logging (hand-rolled formatter, no new dependency) —
+  every accept/reject logs asset_id, seq, and a request id.
+- Real bug caught by smoke-testing with curl (not just pytest): a
+  rejection coming from the clock-skew `@model_validator` — as opposed to
+  a plain field-type error — carries the raw `ValueError` under
+  `ctx.error` in pydantic's error output. Passing that straight into
+  `JSONResponse` crashed the handler with an unhandled `TypeError`
+  ("not JSON serializable"), so a malformed-in-a-specific-way request
+  500'd instead of getting a clean 422. Fixed by stripping `ctx` (the
+  `msg` field already has the readable text) and running everything
+  through `jsonable_encoder` as a backstop. Added a regression test for
+  this exact path, since the other rejection tests all happened to hit
+  plain field errors and wouldn't have caught it.
+- Tested against a real Redis (not mocked) — 9 integration tests, plus
+  the 27 contract unit tests, 36 passing total.
+- Note: this sandbox's Docker daemon can't start (`ulimit` operation not
+  permitted — nested containers are restricted here), so local testing
+  used `redis-server` directly instead of a Redis container. Docker
+  Compose itself will be tested properly once that step is reached; if
+  the sandbox still can't run a daemon then, the compose file will need
+  validating some other way (e.g. `docker compose config`, or handing it
+  to the user to run) and that limitation will be documented in the
+  README.

@@ -1,0 +1,28 @@
+[project]
+name = "blackbox-api"
+version = "0.1.0"
+description = "Ingest + query API for the blackbox telemetry backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "redis>=5.0",
+]
+# telemetry-contract (../../libs/telemetry_contract) is a workspace-local
+# package, not a published one — it's installed separately (`pip install
+# -e libs/telemetry_contract`) rather than resolved as a dependency here,
+# to avoid pip trying to look it up on PyPI. The Dockerfile installs both.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
