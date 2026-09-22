@@ -1,4 +1,4 @@
-# PLAN — blackbox telemetry backend
+# PLAN - blackbox telemetry backend
 
 Status: written before any implementation code. This is the design the
 build will follow; changes to it during implementation are recorded in
