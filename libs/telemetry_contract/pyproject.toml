@@ -1,0 +1,15 @@
+[project]
+name = "telemetry-contract"
+version = "0.1.0"
+description = "Shared telemetry event contract for the blackbox fleet backend (api, worker, simulator)"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7,<3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
