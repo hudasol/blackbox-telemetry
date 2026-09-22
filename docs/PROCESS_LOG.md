@@ -224,3 +224,86 @@ the bottom.
   returned events newest-first bounded to the requested limit, and the
   offline timeout correctly flipped `online` to `false` after no events
   for longer than `ASSET_OFFLINE_TIMEOUT_SECONDS`.
+
+## 2026-09-23 — Docker Compose
+
+- Added `docker-compose.yml` wiring postgres, redis, api, worker, and
+  simulator on one network — `docker compose up --build` is the whole
+  setup step, matching the "one-command reproducibility" requirement in
+  `docs/PLAN.md`. No manual migration step: schema bootstrap already ran
+  at worker startup (`worker/db.py`), so a fresh `pgdata` volume comes up
+  usable on its own.
+- One `Dockerfile` per service (`services/{api,worker,simulator}/Dockerfile`),
+  each built with the repo root as context so it can reach
+  `libs/telemetry_contract` and install it separately from the service's
+  own package — the same workspace-local pattern as local dev, just
+  inside the image instead of a local venv.
+- Startup order is enforced with real healthchecks, not fixed sleeps:
+  `depends_on: condition: service_healthy` on postgres (`pg_isready`)
+  and redis (`redis-cli ping`) before api/worker start; api's own
+  healthcheck hits `/health/ready` — not `/health/live` — specifically
+  so `simulator`'s `depends_on: api: service_healthy` doesn't let it
+  start firing events until api can actually reach both its real
+  dependencies over the compose network, not just until the process is
+  up.
+- `.env.example` documents the few things worth overriding without
+  touching the compose file: log level, the offline timeout, and the
+  simulator's fault-rate switches. Those switches default to non-zero
+  *in compose* (0.1 duplicate/out-of-order/bad-data, 0.05 silence) even
+  though the simulator's own bare defaults are all off — so a plain
+  `docker compose up` demonstrates every documented failure path
+  immediately, not just a clean happy-path fleet.
+- postgres's host port is published as 5433, not 5432 — this sandbox
+  already had a native Postgres bound to 5432 for the local test suite,
+  and 5432 is a common enough default elsewhere that shifting it avoids
+  the same collision for anyone else running this alongside another
+  Postgres. Internal service-to-service traffic is unaffected either
+  way (always `postgres:5432` on the compose network).
+- Correction to a limitation documented on 2026-09-23 (Ingest API entry):
+  this sandbox's Docker daemon could not be started that day. It starts
+  fine now — nothing about the sandbox changed on my end; it was
+  presumably a transient restriction on the container runtime that day,
+  not a permanent one. Recorded here rather than silently overwriting
+  the earlier note, since the earlier entry was accurate for its own
+  day and shaped real decisions (local `redis-server`/`postgresql`
+  instead of containers for all testing through the Query API step).
+- The one thing that could *not* be tested as shipped: this sandbox's
+  outbound HTTPS goes through a TLS-intercepting proxy with a
+  self-signed CA that the sandbox's host Python trusts (via env vars)
+  but a fresh `python:3.12-slim` build container does not, and pip's
+  isolated build-dependency subprocess ignores proxy/cert env vars
+  regardless (`pip install --isolated` behavior) — so `pip install`
+  inside a container here can't reach PyPI at all without sandbox-only
+  workarounds (trusting the sandbox's CA bundle, `--no-build-isolation`)
+  that would be meaningless noise in the committed Dockerfiles, since
+  neither problem exists on a normal network. Worked around it for
+  verification only: built temporary local variants of the three
+  Dockerfiles with those two accommodations added, `docker build
+  --network=host` (to reach the sandbox's loopback-bound proxy) tagged
+  to the exact image names `docker compose build` would produce, then
+  ran `docker compose up` against those pre-built images so the rest —
+  networking, healthchecks, startup ordering, the actual running system
+  — was exercised for real. Deleted the temporary Dockerfiles and the
+  copied CA bundle before committing; `git status` confirms only the
+  intended six files were added.
+- Full live run beyond `docker compose config` (which was also checked):
+  brought up all five containers, confirmed the healthcheck-gated start
+  order (`postgres`/`redis` healthy → `worker`/`api` start → `api`
+  healthy → `simulator` starts), then hit every endpoint through the
+  published port and watched the default fault rates actually produce
+  real `202`/`422` responses and `stored_and_advanced`/`duplicate_ignored`/
+  `stored_but_stale` worker outcomes end-to-end over the compose
+  network (not just localhost, as every prior live demo had used).
+  `docker compose kill -s SIGKILL worker` then `docker compose up -d
+  worker` recovered with zero pending messages (`XPENDING` back to 0)
+  and no gap in `telemetry_events`, mirroring the worker step's own
+  restart-recovery demo but this time through the container runtime.
+  `docker compose down` (no `-v`) then `docker compose up -d` again
+  confirmed `asset_state`/`telemetry_events` survived on the named
+  `pgdata` volume while the Redis stream correctly did not persist
+  (no volume mounted for redis) — the worker just recreated the
+  consumer group and kept going, `latest_seq` continuing to climb with
+  no regression. Cleaned up with `docker compose down -v` afterward.
+  No product bugs found this step — the whole point was proving the
+  packaging, not the system underneath it, which the last five steps
+  had already exercised hard.

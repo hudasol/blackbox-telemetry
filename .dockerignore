@@ -1,0 +1,22 @@
+# Keep the build context small and avoid baking host-only artifacts
+# (a stray .venv or __pycache__ from local dev/test runs) into images.
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+tests/
+docs/
+*.log
+dump.rdb
+.env
+.env.*
+!.env.example

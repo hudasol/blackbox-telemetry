@@ -1,0 +1,114 @@
+# One-command reproducibility (docs/PLAN.md, problem framing): brings up
+# the whole system — postgres, redis, api (ingest + query), worker, and
+# the fault-injecting simulator — wired together on one network, with no
+# manual setup step (schema is bootstrapped by the worker at startup;
+# see worker/db.py).
+#
+#   docker compose up --build
+#
+# api is reachable at http://localhost:8000 (see docs/PLAN.md for the
+# endpoint list). Copy .env.example to .env to override the simulator's
+# fault rates, the offline timeout, etc. — see that file for what's
+# tunable and why.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: blackbox
+      POSTGRES_PASSWORD: blackbox
+      POSTGRES_DB: blackbox
+    # Host port shifted to 5433 — 5432 is commonly already taken by a
+    # local Postgres install (it was, in this sandbox). Services inside
+    # compose always reach this one at postgres:5432 regardless.
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blackbox -d blackbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://blackbox:blackbox@postgres:5432/blackbox
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ASSET_OFFLINE_TIMEOUT_SECONDS: ${ASSET_OFFLINE_TIMEOUT_SECONDS:-10}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_DSN: postgresql://blackbox:blackbox@postgres:5432/blackbox
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Left unset on purpose: defaults to the container's own hostname
+      # (worker/config.py) — fine for D5's "one active worker for now",
+      # and avoids every replica racing to claim the same fixed name if
+      # this is ever scaled with `--scale worker=N`.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  simulator:
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    environment:
+      SIM_API_BASE_URL: http://api:8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SIM_TICK_INTERVAL_SECONDS: ${SIM_TICK_INTERVAL_SECONDS:-1.0}
+      SIM_SEED: ${SIM_SEED:-}
+      # Non-zero by default (unlike the simulator's own bare defaults,
+      # which are all off) so `docker compose up` demonstrates every
+      # documented failure path — duplicates, reordering, rejected
+      # payloads, a silent asset — without any extra configuration.
+      # Override via .env (see .env.example) to run a clean fleet.
+      SIM_DUPLICATE_RATE: ${SIM_DUPLICATE_RATE:-0.1}
+      SIM_OUT_OF_ORDER_RATE: ${SIM_OUT_OF_ORDER_RATE:-0.1}
+      SIM_BAD_DATA_RATE: ${SIM_BAD_DATA_RATE:-0.1}
+      SIM_SILENCE_RATE: ${SIM_SILENCE_RATE:-0.05}
+      SIM_FORCE_SILENT_ASSET_IDS: ${SIM_FORCE_SILENT_ASSET_IDS:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
