@@ -61,3 +61,58 @@ the bottom.
   validating some other way (e.g. `docker compose config`, or handing it
   to the user to run) and that limitation will be documented in the
   README.
+
+## 2026-09-23 — Worker
+
+- Added `services/worker`: consumer-group reader (`XREADGROUP`) for
+  `telemetry.raw`, writing to two Postgres tables — `telemetry_events`
+  (append-only history) and `asset_state` (one row per asset, latest
+  snapshot). No Alembic; schema is `CREATE TABLE IF NOT EXISTS`, run
+  idempotently at startup.
+- Idempotency and ordering are both a single atomic SQL statement, not
+  read-then-write: insert uses `ON CONFLICT (asset_id, seq) DO NOTHING`;
+  the state upsert uses `ON CONFLICT (asset_id) DO UPDATE ... WHERE
+  asset_state.latest_seq < EXCLUDED.latest_seq`, so a stale/out-of-order
+  event can never regress the latest-known state, per PLAN.md's D1 (seq
+  is authority, not timestamp).
+- Restart recovery: every loop iteration first claims stale pending
+  entries (`XAUTOCLAIM`, idle > 30s) before reading new ones, so a
+  message a crashed worker read but never finished — whether or not it
+  had already reached Postgres — gets picked up by whichever consumer
+  restarts next. A message already stored but not yet acked is safe to
+  reprocess: the same `ON CONFLICT DO NOTHING` makes it a no-op, and it
+  finally gets acked.
+- Per-message Postgres failures and stream-level Redis failures both use
+  the same bounded exponential backoff (0.5s, doubling, capped at 30s),
+  and both are interruptible mid-sleep by shutdown so a SIGTERM during a
+  retry doesn't hang — the unacked message is left for the next restart
+  to reclaim rather than lost.
+- A payload that fails to parse (should never happen — ingest already
+  validated it) is logged and acked immediately instead of retried
+  forever; documented in PLAN.md as a known limitation, not silent data
+  loss.
+- Real bug caught by live smoke-testing (not the pytest suite): redis-py
+  enforces its own client-side socket read timeout independently of a
+  command's `BLOCK` argument, and defaults to 5s regardless of what
+  `socket_timeout` you don't pass. A blocking `XREADGROUP ... BLOCK
+  5000` reliably raised a spurious `TimeoutError` every ~5s with Redis
+  completely healthy and just legitimately idle — would have made the
+  worker crash-loop constantly in any real deployment. None of the
+  integration tests caught it because test payloads are always
+  available immediately, so the blocking wait path never actually
+  blocked. Fixed by passing `socket_timeout` explicitly, well above the
+  `BLOCK` duration. Also wrapped the main loop's Redis calls in the same
+  bounded-backoff pattern as the per-message retries, so a transient
+  Redis-level error no longer kills the process either.
+- Tested against real Postgres and Redis, not mocks: 4 unit tests
+  (backoff math), 8 db tests (every ordering/duplicate scenario), 5
+  processing tests (valid, malformed/poison, duplicate, db-failure-then-
+  recovery, shutdown-mid-retry), 2 restart-recovery tests (message
+  never processed; message stored but not yet acked when the crash
+  hit) — 54 passing total across the repo.
+- Live demo beyond the automated suite, matching the brief's stated
+  acceptance check: ran real `uvicorn` + `python -m worker.main`
+  processes, sent a 50-event burst, `kill -9`'d the worker mid-flight,
+  restarted it. Result: `XLEN`=60, `XPENDING`=0, Postgres row count=60 —
+  every event sent across the whole session landed exactly once, with
+  zero loss and zero duplication across two separate hard kills.
