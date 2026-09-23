@@ -81,6 +81,13 @@ curl -s http://localhost:8000/api/v1/assets/drone-01/latest | python3 -m json.to
 # Its recent raw history (newest first)
 curl -s http://localhost:8000/api/v1/assets/drone-01/history?limit=5 | python3 -m json.tool
 
+# Everything between two timestamps, instead of "most recent N" — from
+# and to are both inclusive, and limit still applies as an upper bound
+# even when a range is given
+curl -s -G http://localhost:8000/api/v1/assets/drone-01/history \
+  --data-urlencode "from=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --data-urlencode "to=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | python3 -m json.tool
+
 # Send one event by hand (timestamp_utc must be close to "now" — the api
 # rejects anything more than 60s in the future, so it's generated here
 # rather than hard-coded)
@@ -115,7 +122,7 @@ All endpoints under `/api/v1`. Every response is JSON.
 | `POST` | `/api/v1/telemetry` | Accept one telemetry event. `202` + `{status, asset_id, seq, stream_id}` on success. `422` on a malformed/invalid event (never enqueued). `503` if Redis can't be reached (never a false accept). |
 | `GET` | `/api/v1/assets` | List every known asset with its latest snapshot and computed `online` status. |
 | `GET` | `/api/v1/assets/{asset_id}/latest` | One asset's current snapshot. `404` if the asset has never sent anything. |
-| `GET` | `/api/v1/assets/{asset_id}/history?limit=N` | That asset's raw event history, newest first (`limit` 1–500, default 50). An unknown asset is a valid empty result, not a `404`. |
+| `GET` | `/api/v1/assets/{asset_id}/history?limit=N&from=...&to=...` | That asset's raw event history, newest first (`limit` 1–500, default 50). `from`/`to` (both optional, ISO 8601, inclusive) filter to everything between two timestamps; a naive value with no offset is treated as UTC. `limit` still applies as an upper bound even when a range is given. `from` after `to` is a `422`. An unknown asset is a valid empty result, not a `404`. |
 | `GET` | `/health/live` | Always `200` if the process is up — no dependency checks. |
 | `GET` | `/health/ready` | `200` only if Redis *and* Postgres are both reachable right now; `503` otherwise, with a per-dependency `checks` breakdown. |
 
@@ -177,7 +184,7 @@ bring in `pytest`, `pytest-asyncio`, `httpx`):
 pytest tests/ -v
 ```
 
-101 tests, all passing as of this step. If your Postgres/Redis run on
+108 tests, all passing as of this step. If your Postgres/Redis run on
 different ports or credentials, override with `POSTGRES_TEST_DSN` and
 `REDIS_TEST_URL` (defaults are in `tests/integration/conftest.py`):
 

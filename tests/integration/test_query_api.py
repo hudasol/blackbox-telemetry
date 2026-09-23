@@ -158,7 +158,14 @@ async def test_get_asset_history_for_an_unknown_asset_is_an_empty_200_not_a_404(
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {"asset_id": "never-seen", "limit": 50, "count": 0, "events": []}
+    assert body == {
+        "asset_id": "never-seen",
+        "limit": 50,
+        "from": None,
+        "to": None,
+        "count": 0,
+        "events": [],
+    }
 
 
 async def test_history_limit_is_validated(api_client, pg_pool):
@@ -188,6 +195,129 @@ async def test_history_preserves_extra_fields(api_client, pg_pool):
     response = await api_client.get("/api/v1/assets/drone-01/history")
 
     assert response.json()["events"][0]["extra_fields"] == {"firmware_version": "9.9.9"}
+
+
+# --- history: from/to time-range filtering ------------------------------
+#
+# Fixed, far-in-the-past anchor rather than datetime.now() for every event
+# here — makes the boundary math exact and deterministic instead of racing
+# against wall-clock time, and it's safely outside the contract's 60s
+# future-clock-skew limit (models.py) regardless of when the test runs.
+
+_ANCHOR = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+async def _seed_five_minutely_events(pg_pool):
+    """seq 1..5 at _ANCHOR, _ANCHOR+1min, ..., _ANCHOR+4min."""
+    for seq in range(1, 6):
+        await store_event(
+            pg_pool,
+            make_event(seq=seq, timestamp_utc=_ANCHOR + timedelta(minutes=seq - 1)),
+            datetime.now(timezone.utc),
+        )
+
+
+async def test_history_from_and_to_bound_the_range_inclusively(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    from_ = _ANCHOR + timedelta(minutes=1)  # seq 2, on the boundary
+    to = _ANCHOR + timedelta(minutes=3)  # seq 4, on the boundary
+
+    # params= (not a hand-built query string) so httpx percent-encodes the
+    # "+" in a UTC offset like "+00:00" — a raw f-string URL leaves it as a
+    # literal "+", which a query string decodes as a space, silently
+    # corrupting the timestamp into something that fails to parse. Caught
+    # by this test actually failing with a 422 the first time it was
+    # written with a hand-built URL — see docs/PROCESS_LOG.md.
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history",
+        params={"from": from_.isoformat(), "to": to.isoformat()},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 3
+    assert [e["seq"] for e in body["events"]] == [4, 3, 2]  # newest first, both ends included
+
+
+async def test_history_from_only_is_open_ended_going_forward(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    from_ = _ANCHOR + timedelta(minutes=2)
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history", params={"from": from_.isoformat()}
+    )
+
+    assert [e["seq"] for e in response.json()["events"]] == [5, 4, 3]
+
+
+async def test_history_to_only_is_open_ended_going_backward(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    to = _ANCHOR + timedelta(minutes=2)
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history", params={"to": to.isoformat()}
+    )
+
+    assert [e["seq"] for e in response.json()["events"]] == [3, 2, 1]
+
+
+async def test_history_range_still_respects_limit(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    from_ = _ANCHOR
+    to = _ANCHOR + timedelta(minutes=4)  # covers all 5
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history",
+        params={"from": from_.isoformat(), "to": to.isoformat(), "limit": 2},
+    )
+
+    body = response.json()
+    assert body["count"] == 2
+    assert [e["seq"] for e in body["events"]] == [5, 4]  # still newest-first, still bounded
+
+
+async def test_history_naive_from_to_are_treated_as_utc(api_client, pg_pool):
+    # Same rule as the ingest contract's timestamp_utc (telemetry_contract
+    # models.py): no offset in the string means UTC, not "guess and hope".
+    await _seed_five_minutely_events(pg_pool)
+    naive_from = (_ANCHOR + timedelta(minutes=1)).replace(tzinfo=None)
+    naive_to = (_ANCHOR + timedelta(minutes=3)).replace(tzinfo=None)
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history",
+        params={"from": naive_from.isoformat(), "to": naive_to.isoformat()},
+    )
+
+    assert [e["seq"] for e in response.json()["events"]] == [4, 3, 2]
+
+
+async def test_history_from_after_to_is_422(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    from_ = _ANCHOR + timedelta(minutes=3)
+    to = _ANCHOR + timedelta(minutes=1)
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history",
+        params={"from": from_.isoformat(), "to": to.isoformat()},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_request"
+
+
+async def test_history_from_to_echoed_back_in_the_response(api_client, pg_pool):
+    await _seed_five_minutely_events(pg_pool)
+    from_ = _ANCHOR + timedelta(minutes=1)
+    to = _ANCHOR + timedelta(minutes=3)
+
+    response = await api_client.get(
+        "/api/v1/assets/drone-01/history",
+        params={"from": from_.isoformat(), "to": to.isoformat()},
+    )
+
+    body = response.json()
+    assert datetime.fromisoformat(body["from"]) == from_
+    assert datetime.fromisoformat(body["to"]) == to
 
 
 # --- query endpoints, dependency unavailable ---------------------------

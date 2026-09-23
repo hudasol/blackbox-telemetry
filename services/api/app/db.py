@@ -9,6 +9,7 @@ asset_state.last_seen_at — never stored as a column (decision D3).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import asyncpg
 
@@ -29,8 +30,10 @@ SELECT seq, timestamp_utc, server_received_at,
        battery_pct, temperature_c, link_quality_pct, mode, extra_fields
 FROM telemetry_events
 WHERE asset_id = $1
+  AND ($2::timestamptz IS NULL OR timestamp_utc >= $2)
+  AND ($3::timestamptz IS NULL OR timestamp_utc <= $3)
 ORDER BY seq DESC
-LIMIT $2
+LIMIT $4
 """
 
 
@@ -94,9 +97,20 @@ async def get_asset_latest(
     return _asset_row_to_dict(row) if row is not None else None
 
 
-async def get_asset_history(pool: asyncpg.Pool, asset_id: str, limit: int) -> list[dict]:
+async def get_asset_history(
+    pool: asyncpg.Pool,
+    asset_id: str,
+    limit: int,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+) -> list[dict]:
+    # from_ts/to_ts filter on timestamp_utc (the event's own reported time,
+    # not server_received_at) — that's what a caller means by "everything
+    # between these two timestamps". Both bounds are inclusive. limit still
+    # applies even with a range given, so this stays "bounded history"
+    # (docs/PLAN.md) rather than letting a wide range return everything.
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_HISTORY_SQL, asset_id, limit)
+        rows = await conn.fetch(_HISTORY_SQL, asset_id, from_ts, to_ts, limit)
     return [_event_row_to_dict(row) for row in rows]
 
 

@@ -533,3 +533,66 @@ just talk, went back and closed both.
 - No product bugs in either fix — both were about the gap between what
   was built/tested and what the repository on GitHub actually reflects
   or re-proves, not about the system's own behavior.
+
+## 2026-09-23 — History endpoint: from/to time-range filtering
+
+`GET /api/v1/assets/{asset_id}/history` only supported "most recent N"
+(`limit`). A caller who needs everything between two specific
+timestamps — the actual "minimum api" requirement — had no way to ask
+for that. Added `from`/`to` query parameters alongside the existing
+`limit`, rather than replacing it:
+
+- Both bounds are inclusive and filter on `timestamp_utc` (the event's
+  own reported time, not `server_received_at`) — that's what a caller
+  means by "everything between these two timestamps".
+- `limit` still applies even when a range is given, so this stays
+  "bounded history" (docs/PLAN.md) rather than letting a wide range
+  return an unbounded result.
+- A naive (no offset) `from`/`to` is treated as UTC — the same rule
+  `telemetry_contract.models` already applies to a naive
+  `timestamp_utc` on ingest, now reused via a small `_normalize_utc`
+  helper in `query.py` so there's one definition of what a bare
+  timestamp means, everywhere in this API, not two.
+- `from` after `to` is a 422 (`invalid_request`), the same shape every
+  other bad query parameter already produces — a cross-field check
+  FastAPI's own per-parameter validation can't express on its own.
+- The resolved `from`/`to` are echoed back in the response body, so a
+  caller can see exactly what range was actually applied (including
+  after UTC-normalizing a naive value).
+- SQL stays a single parameterized query for every combination — no
+  filter, from-only, to-only, or both — via `($2::timestamptz IS NULL
+  OR timestamp_utc >= $2)` style clauses, rather than branching to
+  build different SQL strings per case.
+
+Added 7 integration tests (inclusive range, from-only, to-only, range
+still bounded by limit, naive-treated-as-UTC, from-after-to is 422,
+from/to echoed back), plus updated one existing regression test whose
+exact-dict assertion needed the new `from`/`to` keys.
+
+Found and fixed a real bug in the new tests themselves while writing
+them, not in the product: the first version hand-built the request URL
+with an f-string embedding `.isoformat()` datetimes directly, e.g.
+`f"...?from={from_}&to={to}"`. A UTC offset like `+00:00` contains a
+literal `+`, which a query string is not required to percent-encode
+but which standard `application/x-www-form-urlencoded` decoding reads
+back as a space — silently corrupting the timestamp before it ever
+reached the parser. 5 of the 7 new tests failed with unexpected 422s
+as a result, including `test_history_from_after_to_is_422`, which had
+been "passing" for the wrong reason (any 422, not the intended
+cross-field check). Confirmed the root cause with
+`urllib.parse.urlencode({'from': '2026-01-01T00:01:00+00:00'})` →
+`from=2026-01-01T00%3A01%3A00%2B00%3A00`. Fixed by rewriting every new
+test to pass `params={"from": ..., "to": ...}` as a dict to httpx
+instead of a hand-built URL, letting httpx do the percent-encoding —
+the same lesson as always with query strings and special characters,
+just caught here in test code instead of product code.
+
+Verified live end-to-end, not just with pytest: started a real api +
+worker + Redis + Postgres locally (disposable dev instances, not the
+test ones), posted 5 real telemetry events one minute apart through
+`POST /api/v1/telemetry`, let the real worker drain them into Postgres,
+then hit the real `/history` endpoint over HTTP with `from` only,
+`to` only, both, a naive (no-offset) `from`/`to`, `from` after `to`,
+and a range combined with `limit=2` — every case matched the intended
+inclusive-boundary, UTC-normalizing, still-bounded-by-limit behavior.
+Shut down and cleaned up all the disposable dev processes afterward.
