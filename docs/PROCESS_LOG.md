@@ -360,3 +360,46 @@ the bottom.
   found — every gap here was a coverage gap, not a behavior bug; the
   code underneath was already doing the right thing in both cases, it
   just wasn't provable by the suite until now.
+
+## 2026-09-23 — CI
+
+- Added `.github/workflows/ci.yml`: runs the whole suite on every push
+  and every pull request. Real Postgres/Redis as GitHub Actions service
+  containers (`postgres:16-alpine`, `redis:7-alpine`) — not mocks, same
+  as local dev and every step's own testing — with ports and
+  credentials set to exactly match `tests/integration/conftest.py`'s
+  own defaults, so the test job needs no DSN/URL overrides beyond
+  pointing `localhost` at the mapped ports.
+- Install order mirrors local dev and the Dockerfiles exactly: the
+  shared `telemetry_contract` first, then each service editable-
+  installed with its `[dev]` extra (pytest, pytest-asyncio, httpx) on
+  top of its runtime deps — one command per service, no separate
+  requirements file to keep in sync.
+- Added a second, much cheaper job, `compose-config`: just `docker
+  compose config --quiet` against the Docker Compose step's file.
+  `ubuntu-latest` ships Docker and Compose v2 preinstalled, so this
+  costs nothing beyond a checkout, and catches a broken compose file
+  (bad YAML, a missing build context, a typo'd `depends_on` service
+  name) on every push without the cost of actually building five
+  images — a real build was already proven live in the Docker Compose
+  step; this just guards against the file rotting afterward.
+- Checked both pinned action versions against what's actually current
+  right now rather than trusting training data, since an action's
+  major version is exactly the kind of thing that goes stale silently:
+  `actions/checkout` is at v5 (was tempted to write v4 from habit) and
+  `actions/setup-python` is at v6 — both confirmed via a live search,
+  not assumed.
+- Verified the whole job locally before trusting it, not just eyeballed
+  the YAML: built a completely fresh venv with `python3.12` explicitly
+  (the sandbox's bare `python3` is 3.11, which would have silently
+  simulated the wrong runner — caught this on the first attempt, since
+  pip refused every package with "requires a different Python"),
+  installed in the exact order and with the exact commands the
+  workflow uses, then ran the suite with the same env vars the
+  workflow sets, against this sandbox's real Postgres/Redis. 101
+  passed, clean install, no surprises. `docker compose config --quiet`
+  re-checked after pinning the action versions, still clean.
+- No product bugs — this step doesn't touch product code. The one real
+  bug was in my own verification method (simulating with the wrong
+  local Python), caught and fixed before it could have produced a false
+  "CI will pass" confidence.
