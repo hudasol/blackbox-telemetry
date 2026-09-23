@@ -307,3 +307,56 @@ the bottom.
   No product bugs found this step — the whole point was proving the
   packaging, not the system underneath it, which the last five steps
   had already exercised hard.
+
+## 2026-09-23 — Tests
+
+- Every step so far already carried its own tests as it was built (see
+  each entry above) — this step is a deliberate audit, not a first
+  pass: line up `docs/PLAN.md`'s failure-policy table, the brief's own
+  seven rows, against what's actually covered, and close whatever
+  isn't. Went through it row by row against the 97 tests already in
+  place plus a full read of the ingest/query/worker source.
+- Five of seven rows had solid coverage already: malformed/missing
+  fields (contract unit tests + ingest 422 tests), duplicates (worker
+  db tests, worker processing tests, ingest's own "enqueued both times"
+  test), out-of-order/stale (worker db tests, including a 1-3-2
+  arrival-order test), asset-goes-silent (query API's online/offline
+  test), worker killed/restarted (two restart-recovery tests, the
+  NOGROUP self-heal test, and three separate live demos across the
+  Worker/Simulator/Docker Compose steps).
+- Two real gaps found, both closed:
+  - Worker's Postgres-unavailable row was tested only through a
+    monkeypatched `store_event` failing a couple of times inside
+    `process_message` — the *outer* main loop's own generic
+    `except RedisError` backoff-and-recover branch (as opposed to its
+    NOGROUP-specific sibling, which does have a dedicated test) had
+    never actually been pinned down by an automated test. It was only
+    ever caught live, and only by accident — the socket_timeout bug
+    documented under the Worker step happened to exercise the same
+    branch, but that test was never written back once the bug was
+    fixed. Added `test_worker_redis_unavailable_recovery.py`: drives
+    the real `worker.main.run()` loop, monkeypatches `read_new` to
+    raise a plain `RedisError` (deliberately not a NOGROUP
+    `ResponseError`, to land in the other branch) three times before
+    delegating to the real implementation, and confirms the event
+    still gets stored. Mutation-tested it before trusting it: patched
+    `main.py` to re-raise instead of backing off, watched the test
+    fail with exactly the injected error, then reverted — confirming
+    it isn't vacuously passing.
+  - The query endpoints' own `query_unavailable` 503 branch
+    (`routers/query.py`, `_query_unavailable()`) had zero coverage —
+    only `/health/ready`'s parallel-but-separate check was tested. A
+    client hitting `/api/v1/assets` (or `/latest`, or `/history`)
+    while Postgres is down got no automated proof it degrades the same
+    honest way ingest does on a dead Redis, rather than 500ing or
+    hanging. Added three tests in `test_query_api.py`, one per
+    endpoint, against the same `UNREACHABLE_POSTGRES_DSN` the health
+    tests already use.
+- Repeated the two new integration tests (plus the existing NOGROUP
+  one, since it shares the same background-task-driving pattern) three
+  times in a row to rule out timing flakiness before trusting them —
+  all stable.
+- 101 passing total across the repo (97 + 4 new). No product bugs
+  found — every gap here was a coverage gap, not a behavior bug; the
+  code underneath was already doing the right thing in both cases, it
+  just wasn't provable by the suite until now.

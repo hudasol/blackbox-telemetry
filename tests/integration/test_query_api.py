@@ -190,6 +190,42 @@ async def test_history_preserves_extra_fields(api_client, pg_pool):
     assert response.json()["events"][0]["extra_fields"] == {"firmware_version": "9.9.9"}
 
 
+# --- query endpoints, dependency unavailable ---------------------------
+#
+# Distinct from the health-endpoint 503 tests below: these prove each
+# query endpoint's own _query_unavailable() branch (docs/PLAN.md,
+# failure policy — mirrors ingest's "Redis unavailable" -> 503, just for
+# query's Postgres dependency instead), not just that /health/ready can
+# detect the same outage. min_size=0 means pool creation itself always
+# succeeds even when Postgres is down (docs/PROCESS_LOG.md, Query API
+# entry) — the failure only surfaces on the first real acquire, which is
+# exactly what these exercise.
+
+
+async def test_list_assets_is_503_when_postgres_is_unreachable():
+    async with _client_for(REDIS_TEST_URL, UNREACHABLE_POSTGRES_DSN) as client:
+        response = await client.get("/api/v1/assets")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "query_unavailable"
+
+
+async def test_get_asset_latest_is_503_when_postgres_is_unreachable():
+    async with _client_for(REDIS_TEST_URL, UNREACHABLE_POSTGRES_DSN) as client:
+        response = await client.get("/api/v1/assets/drone-01/latest")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "query_unavailable"
+
+
+async def test_get_asset_history_is_503_when_postgres_is_unreachable():
+    async with _client_for(REDIS_TEST_URL, UNREACHABLE_POSTGRES_DSN) as client:
+        response = await client.get("/api/v1/assets/drone-01/history")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "query_unavailable"
+
+
 # --- health endpoints --------------------------------------------------
 
 
