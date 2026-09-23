@@ -1,11 +1,20 @@
 """Postgres access: schema bootstrap, idempotent insert, monotonic upsert.
 
-Both the dedup rule and the "never regress current state" rule are
-enforced as single atomic SQL statements (ON CONFLICT ... DO NOTHING /
-DO UPDATE ... WHERE), not read-then-write from Python — that's what
-makes them race-safe under concurrent/duplicate delivery. See
-docs/PLAN.md, decision D1: seq is the ordering authority, not
-timestamp_utc.
+Two tables:
+  telemetry_events — raw accepted events, append-only, the full history.
+                      (asset_id, seq) is unique: the idempotency key from
+                      docs/PLAN.md, decision D1/D2.
+  asset_state       — one row per asset, the latest snapshot. Updated only
+                      when the incoming seq is strictly newer than what's
+                      already stored there — "state never regresses"
+                      (docs/PLAN.md, failure policy).
+
+Both writes happen in a single transaction, so an event can never end up
+recorded in history but not reflected in current state, or vice versa.
+
+No Alembic: two tables, `CREATE TABLE IF NOT EXISTS` run at startup is the
+whole migration story for this scope, and it doubles as what makes the
+service boot with no manual setup step (docs/PROCESS_LOG.md).
 """
 
 from __future__ import annotations
@@ -73,6 +82,10 @@ ON CONFLICT (asset_id, seq) DO NOTHING
 RETURNING id
 """
 
+# The WHERE clause is what makes "never regress" atomic and race-safe: if
+# the row already has a latest_seq >= the incoming one, the UPDATE simply
+# matches zero rows and RETURNING gives back nothing — no read-then-write
+# needed, no window for a concurrent writer to sneak a regression in.
 _UPSERT_STATE_SQL = """
 INSERT INTO asset_state (
     asset_id, asset_type, latest_seq, latest_timestamp_utc, last_seen_at,
@@ -109,6 +122,9 @@ async def bootstrap_schema(pool: asyncpg.Pool) -> None:
 
 
 class StoreResult:
+    """What actually happened, so the caller can log it precisely instead
+    of just "it worked"."""
+
     __slots__ = ("event_inserted", "state_advanced")
 
     def __init__(self, event_inserted: bool, state_advanced: bool) -> None:
@@ -163,6 +179,7 @@ async def store_event(
             event.link_quality_pct,
             event.mode.value,
         )
+
     return StoreResult(
         event_inserted=inserted_id is not None,
         state_advanced=advanced_asset_id is not None,

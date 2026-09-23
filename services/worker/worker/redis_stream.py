@@ -1,3 +1,9 @@
+"""Redis Streams consumer-group plumbing.
+
+Kept separate from "what to do with a message" (processing.py) so the
+mechanics of getting messages don't tangle with what happens to them.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -10,9 +16,13 @@ logger = logging.getLogger("worker.stream")
 
 
 async def ensure_consumer_group(redis: Redis) -> None:
+    """Create the consumer group at the start of the stream if it doesn't
+    exist yet. Starting at "0" (not "$") means a worker that's the first
+    thing to ever read this stream still sees everything already in it,
+    rather than silently skipping whatever arrived before the group
+    existed.
+    """
     try:
-        # id="0" (not "$") so a worker starting for the first time against
-        # a stream that already has entries doesn't skip them.
         await redis.xgroup_create(
             STREAM_NAME, CONSUMER_GROUP_NAME, id="0", mkstream=True
         )
@@ -33,10 +43,13 @@ async def ensure_consumer_group(redis: Redis) -> None:
 async def claim_stale_pending(
     redis: Redis, consumer_name: str, min_idle_ms: int, count: int = 50
 ) -> list[tuple[str, dict]]:
-    """Reclaim entries idle longer than min_idle_ms, regardless of which
-    consumer originally read them — that's what makes a worker restart
-    (under any consumer name) recover a previous instance's in-flight
-    work."""
+    """Reclaim messages that have been pending (read but never acked) for
+    longer than min_idle_ms — from this worker's own earlier crash, or a
+    different consumer that died. XAUTOCLAIM works group-wide regardless
+    of which consumer name originally read the message, which is what
+    makes "worker killed and restarted" actually recoverable rather than
+    just quietly stuck (docs/PLAN.md, failure policy).
+    """
     _next_cursor, messages, _deleted = await redis.xautoclaim(
         STREAM_NAME,
         CONSUMER_GROUP_NAME,

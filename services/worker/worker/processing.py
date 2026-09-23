@@ -1,3 +1,10 @@
+"""Per-message processing: parse, store (idempotent + monotonic), ack.
+
+The one rule this module exists to enforce: a message is never acked
+before it's durably stored, and never silently dropped on failure — it's
+retried with bounded backoff instead (docs/PLAN.md, failure policy).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +26,10 @@ BACKOFF_MULTIPLIER = 2.0
 
 
 def next_backoff_seconds(attempt: int) -> float:
-    return min(BACKOFF_INITIAL_SECONDS * (BACKOFF_MULTIPLIER**attempt), BACKOFF_MAX_SECONDS)
+    """attempt is 0-indexed (first retry is attempt=0)."""
+    return min(
+        BACKOFF_INITIAL_SECONDS * (BACKOFF_MULTIPLIER**attempt), BACKOFF_MAX_SECONDS
+    )
 
 
 def _parse_received_at(fields: dict) -> datetime:
@@ -29,6 +39,9 @@ def _parse_received_at(fields: dict) -> datetime:
             return datetime.fromisoformat(raw)
         except ValueError:
             pass
+    # Missing/unparseable is itself a sign of a malformed message, but a
+    # timestamp is required to store the row — fall back rather than fail
+    # the whole message over a field that isn't the point of this check.
     return datetime.now(timezone.utc)
 
 
@@ -42,12 +55,14 @@ async def process_message(
     try:
         event = TelemetryEvent.model_validate_json(fields["payload"])
     except (ValidationError, KeyError, ValueError) as exc:
-        # Should never happen — the ingest API already validated this
-        # payload before it was ever enqueued. If it does (a hand-crafted
-        # stream entry, or a future incompatible contract change), retrying
-        # forever would just wedge the consumer group. Log loudly and move
-        # on rather than build full dead-letter handling here — see
-        # docs/PLAN.md's known-limitations note.
+        # This should never happen — the ingest API already validated the
+        # event before enqueueing it. If it does (a bug, a schema change,
+        # a hand-crafted stream entry), it's a poison message: retrying it
+        # forever would just wedge the stream on something that can never
+        # succeed. Full dead-letter handling (inspect/replay) is an
+        # exceeds-the-bar item; for now this is logged loudly and acked
+        # so it doesn't block everything behind it — see docs/PLAN.md,
+        # "known limitation".
         logger.error(
             "telemetry.payload_unparseable",
             extra={
@@ -61,6 +76,7 @@ async def process_message(
 
     server_received_at = _parse_received_at(fields)
     attempt = 0
+
     while not shutdown_event.is_set():
         try:
             result = await db.store_event(pool, event, server_received_at)
@@ -99,9 +115,9 @@ async def process_message(
         await ack(redis, message_id)
         return
 
-    # Shutting down mid-retry: leave the message unacked. It stays in the
-    # consumer group's Pending Entries List and gets picked up by
-    # claim_stale_pending on the next startup — never silently dropped.
+    # Shutdown was requested mid-retry: leave the message unacked. It's
+    # still in the Pending Entries List and will be reclaimed by
+    # claim_stale_pending on the next startup — not lost, not duplicated.
     logger.info(
         "telemetry.processing_deferred_on_shutdown",
         extra={
