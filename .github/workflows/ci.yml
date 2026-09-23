@@ -79,3 +79,57 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker compose config --quiet
+
+  # The real "does docker compose up --build actually work, today" proof.
+  # docs/PROCESS_LOG.md's Docker Compose and README entries both note
+  # that this sandbox's network can only prove a full image rebuild once,
+  # manually, with a workaround — so that proof goes stale the moment
+  # anything (a dependency release, a base image update, a Dockerfile
+  # edit) changes what actually gets built. This job re-proves it fresh
+  # on every single push instead, on a runner with a normal network (no
+  # proxy workaround needed here). It's not re-testing failure-recovery
+  # logic — that's already covered thoroughly by the `test` job and by
+  # the live demos recorded in PROCESS_LOG.md — just that the packaging
+  # itself builds, starts in the right order, and produces real traffic
+  # end to end, exactly like a person running this for the first time
+  # would see.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for the api to report ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health/ready > /dev/null; then
+              echo "api is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "api never became ready within 60s"
+          docker compose logs
+          exit 1
+
+      - name: Confirm the simulator's traffic actually reached Postgres
+        run: |
+          sleep 8
+          curl -sf http://localhost:8000/api/v1/assets -o /tmp/assets.json
+          cat /tmp/assets.json
+          python3 -c "
+          import json
+          assets = json.load(open('/tmp/assets.json'))['assets']
+          assert len(assets) > 0, 'no assets reported - simulator traffic never reached postgres'
+          print(f'OK: {len(assets)} asset(s) reporting')
+          "
+
+      - name: Compose logs (always, for debugging a failure)
+        if: always()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

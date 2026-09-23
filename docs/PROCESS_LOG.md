@@ -467,3 +467,69 @@ the bottom.
 - No product bugs. One real bug, in the README's own demo instructions
   (the stale-timestamp example above) — exactly the kind this step
   exists to catch before a reader hits it instead.
+
+## 2026-09-23 — Closing out two process lessons from this build
+
+Asked, after all nine steps were done, for an honest retrospective: did
+every step go well, and what would be done differently. Two real
+process lessons came out of that — not product bugs, but gaps in how
+the work itself was pushed and verified — and rather than leave them as
+just talk, went back and closed both.
+
+- **Lesson 1: a push can silently diverge from what was tested.** The
+  README step's first push accidentally sent a truncated copy of this
+  file (caught and fixed same-step, see above). That raised the
+  question of whether anything *earlier* had the same problem and just
+  went unnoticed. Checked, properly this time: compared the git blob
+  SHA of every one of the 59 tracked files between the local repo and
+  GitHub's `main`, not just spot-checked a few. Found three more —
+  `services/worker/worker/db.py`, `processing.py`, and
+  `redis_stream.py` — out of sync since the original Worker step commit
+  itself. Diffed both versions line by line before concluding anything:
+  every SQL statement, function body, and return value was identical:
+  the only drift was docstrings and explanatory comments added locally
+  before that commit was made, that never made it into whatever content
+  got pasted into that step's push call. Never a behavior difference —
+  nothing running in production ever differed from what was tested —
+  but a real gap between "what's in the repo I reviewed" and "what's
+  actually on GitHub" all the same. Pushed the correct, fully-documented
+  versions of all three files and re-verified their SHAs now match.
+  Two harmless leftover `.gitkeep` files (`.github/workflows/.gitkeep`,
+  `services/simulator/simulator/.gitkeep`) showed up on GitHub but not
+  locally — pre-real-files scaffolding, zero bytes, no effect on
+  anything; left alone rather than treated as part of this cleanup.
+  The standing rule going forward: never reconstruct a file's content
+  for a push from memory or from what's already in context — always
+  read it fresh, immediately before that specific push call, no matter
+  how recently it was written or how confident the content seems.
+- **Lesson 2: the one full `docker compose up --build` proof was
+  already a few steps old.** The Docker Compose step proved a genuine
+  from-scratch build and run worked, but only once, manually, using a
+  sandbox-only workaround for this environment's TLS-intercepting
+  proxy (documented under that step) — a proof that goes stale the
+  moment a dependency release, a base image update, or a Dockerfile
+  edit changes what actually gets built, with nothing to notice if it
+  breaks. Closed this permanently rather than just re-running it once
+  more: added a third CI job, `docker-smoke`, that runs `docker compose
+  up -d --build` for real on every push, polls `/health/ready` until
+  the api answers, then confirms `/api/v1/assets` actually shows
+  traffic that came from the simulator through the worker into
+  Postgres — the same thing the Docker Compose step's live demo proved
+  by hand, now proved automatically, forever, on every single push.
+  GitHub's runners have a normal network, so this needs none of this
+  sandbox's proxy workaround. Verified the exact script (build, health
+  poll, traffic check, teardown) locally first, using that same
+  sandbox-only workaround one more time for verification only:
+  hand-built all three images with the documented `--no-build-isolation`
+  / trusted-CA accommodations, tagged to the exact names `docker
+  compose build` would produce, then ran the real `docker compose up
+  -d` (no rebuild needed, since the tags already matched) followed by
+  the exact wait-loop and `/api/v1/assets` check the new CI job uses —
+  api became ready on the first poll, three assets showed up with
+  climbing `seq` numbers within seconds, logs confirmed the worker
+  storing them and the simulator sending them. Deleted the temporary
+  images and the copied CA bundle afterward; `git status` and `docker
+  images` both confirm nothing sandbox-specific was left behind.
+- No product bugs in either fix — both were about the gap between what
+  was built/tested and what the repository on GitHub actually reflects
+  or re-proves, not about the system's own behavior.
