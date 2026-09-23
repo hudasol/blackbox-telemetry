@@ -26,32 +26,47 @@ found): [`docs/PROCESS_LOG.md`](docs/PROCESS_LOG.md).
    postgresql — telemetry_events (raw) + asset_state (latest snapshot)
 ```
 
-## Run it (one command)
+## Run it (two commands)
 
 Requires Docker with Compose v2 (`docker compose`, not `docker-compose`).
 
 ```bash
-docker compose up --build
+# 1. Bring up the real system: Postgres, Redis, the api (ingest + query),
+#    and the worker. No synthetic traffic yet.
+docker compose up --build -d
 ```
 
-This builds and starts everything — Postgres, Redis, the `api` (ingest +
-query), the `worker`, and the fault-injecting `simulator` — wired together
-on one network, with no manual setup step: the worker bootstraps the
-Postgres schema itself at startup. Services come up in real dependency
-order (`depends_on: condition: service_healthy`, not a fixed sleep), so
-the simulator only starts sending once the api is actually ready to
-receive.
+This builds and starts the actual product — wired together on one
+network, with no manual setup step: the worker bootstraps the Postgres
+schema itself at startup. Services come up in real dependency order
+(`depends_on: condition: service_healthy`, not a fixed sleep). The api
+is reachable at `http://localhost:8000` once it's up; `GET
+/api/v1/assets` returns `{"assets": []}` until something sends telemetry
+— there's no fleet running yet on purpose.
 
-The api is reachable at `http://localhost:8000` once it's up. The
-simulator starts generating traffic for a small default fleet
-(`drone-01`, `rover-01`, `quad-01`) immediately, with fault injection
-**on by default** (duplicates, out-of-order sequences, rejected payloads,
-one asset occasionally going silent) so a plain `docker compose up`
-demonstrates every failure path in `docs/PLAN.md` without any extra
-configuration.
+```bash
+# 2. Start the simulated fleet — separate test equipment (docs/PLAN.md,
+#    problem framing), not part of the product, so it's a second,
+#    explicit command against the system that's already up.
+docker compose --profile simulator up --build -d simulator
+```
 
-Stop everything with `Ctrl+C`, or `docker compose down` (add `-v` to also
-drop the Postgres volume and start clean next time).
+This starts a small default fleet (`drone-01`, `rover-01`, `quad-01`)
+sending real HTTP traffic to the api that's already running, with fault
+injection **on by default** (duplicates, out-of-order sequences,
+rejected payloads, one asset occasionally going silent) so this second
+command alone demonstrates every failure path in `docs/PLAN.md` without
+any extra configuration.
+
+Stop everything with `docker compose --profile simulator down -v` (`-v`
+also drops the Postgres volume, for a clean start next time). The
+`--profile simulator` flag matters here: a bare `docker compose down`
+only acts on the un-profiled services (same set a bare `docker compose
+up` starts) and leaves the simulator container running. To stop just
+the fleet and keep the system running, `docker compose stop simulator`
+works fine without the flag — profiles only gate a command that has to
+guess *which* services to act on; naming one explicitly (`logs`,
+`stop`, `down <service>`) always works.
 
 ### Configuring the demo
 
@@ -62,7 +77,8 @@ See `.env.example` for the full list and what each knob does.
 
 ## Demo: watching it work
 
-With the stack up (`docker compose up --build`), in another terminal:
+With the system and the simulated fleet both up (the two commands
+above), in another terminal:
 
 ```bash
 # Structured logs from every service, interleaved
@@ -211,7 +227,7 @@ services/worker/            Redis stream -> Postgres, idempotent + crash-safe
 services/simulator/         fake fleet + fault injection (test equipment only)
 tests/unit/                 pure-logic tests, no external services
 tests/integration/          real Postgres + real Redis, incl. failure cases
-docker-compose.yml          one-command full stack
+docker-compose.yml          system + simulated fleet (kept as two separate commands)
 docs/PLAN.md                design: architecture, contract, failure policy
 docs/PROCESS_LOG.md         running build log — decisions, bugs found, fixes
 ```

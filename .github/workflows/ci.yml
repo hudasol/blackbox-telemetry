@@ -98,7 +98,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Build and start the full stack
+      # Two real commands now, matching README.md exactly: the simulator
+      # sits behind a compose profile (docker-compose.yml) so bringing up
+      # the actual system never implies bringing up synthetic traffic too.
+      # This job proves both steps, not just the bundled old one.
+      - name: Build and start the real system (no simulator yet)
         run: docker compose up -d --build
 
       - name: Wait for the api to report ready
@@ -114,22 +118,36 @@ jobs:
           docker compose logs
           exit 1
 
+      - name: Confirm the system reports zero assets before the simulator starts
+        run: |
+          curl -sf http://localhost:8000/api/v1/assets -o /tmp/assets_before.json
+          cat /tmp/assets_before.json
+          python3 -c "
+          import json
+          assets = json.load(open('/tmp/assets_before.json'))['assets']
+          assert assets == [], f'expected no assets before the simulator starts, got {assets}'
+          print('OK: no synthetic traffic before the simulator is started')
+          "
+
+      - name: Start the simulated fleet (second, separate command)
+        run: docker compose --profile simulator up -d --build simulator
+
       - name: Confirm the simulator's traffic actually reached Postgres
         run: |
           sleep 8
-          curl -sf http://localhost:8000/api/v1/assets -o /tmp/assets.json
-          cat /tmp/assets.json
+          curl -sf http://localhost:8000/api/v1/assets -o /tmp/assets_after.json
+          cat /tmp/assets_after.json
           python3 -c "
           import json
-          assets = json.load(open('/tmp/assets.json'))['assets']
+          assets = json.load(open('/tmp/assets_after.json'))['assets']
           assert len(assets) > 0, 'no assets reported - simulator traffic never reached postgres'
           print(f'OK: {len(assets)} asset(s) reporting')
           "
 
       - name: Compose logs (always, for debugging a failure)
         if: always()
-        run: docker compose logs
+        run: docker compose --profile simulator logs
 
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: docker compose --profile simulator down -v

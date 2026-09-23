@@ -3,9 +3,10 @@
 # every service installs separately, same as local dev (docs/PLAN.md).
 #
 # Test equipment, not part of the product (docs/PLAN.md, problem
-# framing) — included in compose so "one command" also gives a live,
-# occasionally-broken telemetry stream to look at, not just idle
-# services.
+# framing) — kept behind the "simulator" compose profile (see
+# docker-compose.yml) so bringing up the real system never implies
+# bringing up synthetic traffic too; started with its own explicit
+# second command instead.
 FROM python:3.12-slim
 
 WORKDIR /app

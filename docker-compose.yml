@@ -1,10 +1,18 @@
-# One-command reproducibility (docs/PLAN.md, problem framing): brings up
-# the whole system — postgres, redis, api (ingest + query), worker, and
-# the fault-injecting simulator — wired together on one network, with no
-# manual setup step (schema is bootstrapped by the worker at startup;
-# see worker/db.py).
+# Two-command reproducibility. docs/PLAN.md's own problem framing says
+# the simulator is "separate test equipment, not part of the product" —
+# this file now actually enforces that split, not just states it:
 #
 #   docker compose up --build
+#
+# brings up the real system only — postgres, redis, api (ingest + query),
+# worker — wired together on one network, with no manual setup step
+# (schema is bootstrapped by the worker at startup; see worker/db.py).
+# The simulator is gated behind a compose profile, so this command alone
+# never starts synthetic traffic.
+#
+#   docker compose --profile simulator up --build -d simulator
+#
+# starts the simulated fleet against that already-running system.
 #
 # api is reachable at http://localhost:8000 (see docs/PLAN.md for the
 # endpoint list). Copy .env.example to .env to override the simulator's
@@ -87,6 +95,13 @@ services:
     restart: unless-stopped
 
   simulator:
+    # Gated behind a profile: services without a `profiles:` key are
+    # always part of a plain `docker compose up`, but a profiled service
+    # is excluded from every command (up, build, down, ...) unless that
+    # profile is explicitly activated with --profile. This is what makes
+    # "bring up the system" and "start the simulators" two real, separate
+    # commands instead of one command doing both.
+    profiles: ["simulator"]
     build:
       context: .
       dockerfile: services/simulator/Dockerfile

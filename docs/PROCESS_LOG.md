@@ -596,3 +596,111 @@ then hit the real `/history` endpoint over HTTP with `from` only,
 and a range combined with `limit=2` — every case matched the intended
 inclusive-boundary, UTC-normalizing, still-bounded-by-limit behavior.
 Shut down and cleaned up all the disposable dev processes afterward.
+
+## 2026-09-23 — Acceptance-check verification, and a real gap found and fixed
+
+Asked to check three acceptance-check items against the actual product:
+(1) one command brings the system up, a separate command starts the
+simulators; (2) all three simulated assets run for at least ten minutes
+with latest state and history staying correct; (3) duplicate,
+out-of-order, malformed, and silent-asset cases behave exactly as
+documented and are covered by tests.
+
+(2) and (3) were verified live, not just by reading code. For (2): ran
+api + worker + all three simulators (drone-01, rover-01, quad-01) for
+~12 minutes against disposable Postgres/Redis, with the same fault
+rates `docker compose up` uses by default. Snapshotted `/api/v1/assets`
+every 20s (36 snapshots) — `latest_seq` climbed monotonically for every
+asset, zero regressions. At the end, `asset_state.latest_seq` matched
+the true max stored `seq` in Postgres exactly for all three assets,
+`/history` was correctly newest-first, and there wasn't a single 500 or
+unhandled exception across the run (worker outcomes: 1,706
+`stored_and_advanced`, 212 `duplicate_ignored`, 158 `stored_but_stale`).
+For (3): cross-checked `docs/PLAN.md`'s failure-policy table against
+that same live run's actual outcomes (matched exactly) and against the
+existing test suite (each of the four cases already has dedicated
+tests: `test_duplicate_seq_is_not_inserted_twice` and 2 more,
+`test_out_of_order_event_is_stored_but_does_not_regress_state` and 2
+more, 10+ malformed/rejection tests across the contract, ingest, and
+simulator-corruption layers, `test_list_assets_returns_all_known_assets_with_online_status`
+for silent/offline). No gaps found in either.
+
+(1) was a real gap, not just a documentation shortfall. `docker-compose.yml`
+had only ever exposed one command, `docker compose up --build`, which
+started postgres, redis, api, worker, *and* the simulator together —
+even though `docs/PLAN.md`'s own problem framing has said since the
+very first commit that the simulator is "separate test equipment, not
+part of the product." That line was never wrong, but it was never
+enforced: the Docker Compose step (see that entry above) explicitly
+chose to bundle the simulator into the one-command `up` so a plain
+`docker compose up` would "demonstrate every failure path... without
+any extra configuration" — a deliberate demo-convenience decision that,
+in hindsight, traded away the very separation the plan had already
+called for. Nothing caught this at the time because nothing was
+checking for it: the Docker Compose step's own acceptance bar was "does
+`docker compose up --build` bring up a working system with visible
+traffic", which it did, honestly — the bar just didn't ask whether
+*only* the product should come up.
+
+Why it matters beyond just matching a spec: bundling test-equipment
+startup into the product's own startup path means anyone bringing up
+"the system" always also gets a fleet of fake assets flooding it with
+traffic, whether they wanted that or not. That makes it harder to
+inspect the real system in isolation (e.g. sending a few hand-crafted
+events via curl to check a specific case, without random simulator
+traffic interleaved), and it quietly widens what counts as "the
+product" to include the thing `docs/PLAN.md` explicitly says isn't
+part of it.
+
+Fixed by giving the `simulator` service in `docker-compose.yml` a
+compose profile (`profiles: ["simulator"]`). A profiled service is
+excluded from every command that has to guess which services to act on
+(`up`, `down`, `build` with no service names given) unless that profile
+is explicitly activated with `--profile`; naming a service explicitly
+(`logs`, `stop`, `down <service>`) still works either way. So now:
+
+- `docker compose up --build` brings up only postgres, redis, api,
+  worker — the real product, with zero synthetic traffic.
+- `docker compose --profile simulator up --build -d simulator` is the
+  separate, second command that starts the simulated fleet against the
+  already-running system.
+- `docker compose --profile simulator down -v` tears down everything,
+  simulator included — a bare `docker compose down` only touches the
+  un-profiled services and leaves the simulator container running,
+  which was surprising enough on first test that it's called out
+  explicitly in README.md now.
+
+Verified for real, not just via `docker compose config`: started the
+Docker daemon in this sandbox (worked this time — same transient
+restriction noted in the Docker Compose step's entry, not a permanent
+one) and, using that step's documented pip/proxy workaround, built and
+tagged all three images to the exact names compose expects. Ran the
+actual two-command sequence: `docker compose up -d` brought up exactly
+four containers, api healthy, `/api/v1/assets` returning `{"assets":
+[]}`; `docker compose --profile simulator up -d simulator` started a
+fifth container and real telemetry began arriving seconds later. Also
+tested the teardown edge case by hand before writing it into the
+README: a bare `docker compose down -v` left the simulator container
+running (and failed to remove the network because of it), while
+`docker compose --profile simulator down -v` removed everything
+cleanly — confirmed both ways rather than assuming which one was
+correct. Deleted the temporary images and the copied CA bundle
+afterward.
+
+Updated to match: `docker-compose.yml`'s top comment and the
+simulator service's own comment; `services/simulator/Dockerfile`'s
+comment (previously said it was "included in compose so 'one command'
+also gives a live... telemetry stream" — no longer true, rewritten);
+`README.md`'s "Run it" section (now two commands, plus the
+`down`-needs-`--profile`-too note); `.env.example`'s comment about
+which command shows the fault-injection defaults; and
+`.github/workflows/ci.yml`'s `docker-smoke` job, which previously
+brought everything up in one `docker compose up -d --build` and would
+otherwise have silently stopped proving anything once the simulator
+stopped starting alongside it — it now runs both commands, asserts
+`/api/v1/assets` is empty *before* the simulator starts (proving the
+split actually holds, not just that traffic eventually shows up) and
+non-empty after, and tears down with `--profile simulator`.
+No product code changed — this was entirely about the gap between what
+`docs/PLAN.md` said the architecture was and what the packaging around
+it actually enforced.
