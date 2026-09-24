@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
-from telemetry_contract import STREAM_NAME, TelemetryEvent
+from telemetry_contract import DEADLETTER_STREAM_NAME, STREAM_NAME, TelemetryEvent
 from worker import db
 from worker.processing import process_message
 from worker.redis_stream import ensure_consumer_group
@@ -97,6 +97,68 @@ async def test_malformed_payload_is_logged_and_acked_not_retried_forever(
 
     count = await pg_pool.fetchval("SELECT count(*) FROM telemetry_events")
     assert count == 0  # nothing sane to store
+
+    # Not just discarded, though: the original bytes are preserved on the
+    # dead-letter stream so an operator can inspect/replay it (see
+    # test_deadletter_replay_puts_the_message_back_for_reprocessing below,
+    # and docs/IMPROVEMENTS.md).
+    deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
+    assert len(deadlettered) == 1
+    _entry_id, dl_fields = deadlettered[0]
+    assert dl_fields["original_message_id"] == message_id
+    assert dl_fields["payload"] == "not valid json"
+    assert "reason" in dl_fields and dl_fields["reason"]  # the parse error, not blank
+
+
+async def test_deadletter_replay_puts_the_message_back_for_reprocessing(
+    pg_pool, redis_client
+):
+    """The other half of poison-message handling: once a dead-lettered
+    entry is replayed (api/routers/deadletter.py's job — exercised here
+    directly against Redis, the same primitives that router uses), the
+    worker processes it exactly like any other message. A payload that's
+    valid *now* (e.g. hand-fixed before replay) is stored normally."""
+    await ensure_consumer_group(redis_client)
+    bad_message_id = await redis_client.xadd(STREAM_NAME, {"payload": "still not json"})
+    response = await redis_client.xreadgroup(
+        "worker-group", "test-consumer", {STREAM_NAME: ">"}, count=1
+    )
+    _stream, messages = response[0]
+    message_id, fields = messages[0]
+    await process_message(redis_client, pg_pool, message_id, fields, asyncio.Event())
+
+    deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
+    assert len(deadlettered) == 1
+    entry_id, dl_fields = deadlettered[0]
+    assert dl_fields["original_message_id"] == bad_message_id
+
+    # Replay: put a *now-valid* payload back on telemetry.raw under the
+    # same asset_id/seq bookkeeping, then drop the dead-letter entry —
+    # exactly what POST .../deadletter/{id}/replay does.
+    fixed_event = TelemetryEvent(**valid_payload(seq=7))
+    await redis_client.xadd(
+        STREAM_NAME,
+        {
+            "asset_id": fixed_event.asset_id,
+            "seq": str(fixed_event.seq),
+            "received_at": dl_fields["received_at"] or datetime.now(timezone.utc).isoformat(),
+            "payload": fixed_event.model_dump_json(),
+        },
+    )
+    await redis_client.xdel(DEADLETTER_STREAM_NAME, entry_id)
+
+    replayed_message_id, replayed_fields = await read_one(redis_client, consumer="replay-consumer")
+    await process_message(
+        redis_client, pg_pool, replayed_message_id, replayed_fields, asyncio.Event()
+    )
+
+    row = await pg_pool.fetchrow(
+        "SELECT * FROM telemetry_events WHERE asset_id = $1 AND seq = $2",
+        "drone-01",
+        7,
+    )
+    assert row is not None  # the replayed event landed
+    assert await redis_client.xrange(DEADLETTER_STREAM_NAME) == []  # and is gone from dead-letter
 
 
 async def test_duplicate_message_is_acked_without_a_second_row(pg_pool, redis_client):
