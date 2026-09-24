@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 from telemetry_contract import STREAM_NAME, TelemetryEvent
 
+from ..metrics import INGEST_EVENTS_TOTAL, INGEST_LATENCY_SECONDS
+
 router = APIRouter(prefix="/api/v1", tags=["ingest"])
 logger = logging.getLogger("api.ingest")
 
@@ -51,6 +53,7 @@ async def ingest_telemetry(event: TelemetryEvent, request: Request):
             },
         )
     except RedisError as exc:
+        INGEST_EVENTS_TOTAL.labels(outcome="queue_unavailable").inc()
         logger.error(
             "telemetry.enqueue_failed",
             extra={
@@ -71,7 +74,10 @@ async def ingest_telemetry(event: TelemetryEvent, request: Request):
             },
         )
 
-    latency_ms = round((time.monotonic() - start) * 1000, 2)
+    elapsed_seconds = time.monotonic() - start
+    INGEST_EVENTS_TOTAL.labels(outcome="accepted").inc()
+    INGEST_LATENCY_SECONDS.observe(elapsed_seconds)
+    latency_ms = round(elapsed_seconds * 1000, 2)
     logger.info(
         "telemetry.enqueued",
         extra={

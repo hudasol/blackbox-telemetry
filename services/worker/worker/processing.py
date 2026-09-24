@@ -8,7 +8,9 @@ retried with bounded backoff instead (docs/PLAN.md, failure policy).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import asyncpg
@@ -16,7 +18,8 @@ from pydantic import ValidationError
 from telemetry_contract import TelemetryEvent
 
 from . import db
-from .redis_stream import ack, send_to_deadletter
+from .metrics import DB_RETRIES_TOTAL, MESSAGES_PROCESSED_TOTAL, PROCESSING_LATENCY_SECONDS
+from .redis_stream import ack, publish_state_update, send_to_deadletter
 
 logger = logging.getLogger("worker.processing")
 
@@ -30,6 +33,19 @@ def next_backoff_seconds(attempt: int) -> float:
     return min(
         BACKOFF_INITIAL_SECONDS * (BACKOFF_MULTIPLIER**attempt), BACKOFF_MAX_SECONDS
     )
+
+
+def _state_update_payload(event: TelemetryEvent, outcome: str) -> str:
+    """The JSON published to STATE_UPDATE_CHANNEL_NAME for GET
+    /api/v1/stream (docs/IMPROVEMENTS.md, "live state stream"). The full
+    event, not a trimmed-down shape — a live subscriber wants what an
+    ingest client sent, same as GET .../history returns. `outcome` is
+    added so a subscriber can tell "this asset actually moved forward"
+    (stored_and_advanced) apart from an out-of-order event that was
+    merely recorded (stored_but_stale) or a resend (duplicate_ignored) —
+    the same distinction worker.db.StoreResult already makes.
+    """
+    return json.dumps({"outcome": outcome, **json.loads(event.model_dump_json())})
 
 
 def _parse_received_at(fields: dict) -> datetime:
@@ -52,6 +68,7 @@ async def process_message(
     fields: dict,
     shutdown_event: asyncio.Event,
 ) -> None:
+    started_at = time.monotonic()
     try:
         event = TelemetryEvent.model_validate_json(fields["payload"])
     except (ValidationError, KeyError, ValueError) as exc:
@@ -67,6 +84,8 @@ async def process_message(
         # docs/IMPROVEMENTS.md, poison-message handling.
         await send_to_deadletter(redis, message_id, fields, reason=str(exc))
         await ack(redis, message_id)
+        MESSAGES_PROCESSED_TOTAL.labels(outcome="deadlettered").inc()
+        PROCESSING_LATENCY_SECONDS.observe(time.monotonic() - started_at)
         return
 
     server_received_at = _parse_received_at(fields)
@@ -76,6 +95,7 @@ async def process_message(
         try:
             result = await db.store_event(pool, event, server_received_at)
         except (asyncpg.PostgresError, OSError) as exc:
+            DB_RETRIES_TOTAL.inc()
             delay = next_backoff_seconds(attempt)
             logger.warning(
                 "telemetry.db_retry",
@@ -108,11 +128,22 @@ async def process_message(
             },
         )
         await ack(redis, message_id)
+        MESSAGES_PROCESSED_TOTAL.labels(outcome=result.outcome).inc()
+        PROCESSING_LATENCY_SECONDS.observe(time.monotonic() - started_at)
+        # Only *after* the ack above — this is a best-effort live-view
+        # side channel (docs/IMPROVEMENTS.md, "live state stream"), never
+        # something the store/ack decision waits on. See
+        # publish_state_update's own docstring for why a publish failure
+        # is swallowed rather than raised here.
+        await publish_state_update(redis, _state_update_payload(event, result.outcome))
         return
 
-    # Shutdown was requested mid-retry: leave the message unacked. It's
-    # still in the Pending Entries List and will be reclaimed by
-    # claim_stale_pending on the next startup — not lost, not duplicated.
+    # Shutdown was requested mid-retry: leave the message unacked. Not
+    # counted in MESSAGES_PROCESSED_TOTAL — it hasn't finished, and no
+    # state update is published either. It's still in the Pending
+    # Entries List and will be reclaimed by claim_stale_pending on the
+    # next startup — not lost, not duplicated — and reprocessing it then
+    # will both count it and publish it at that point instead.
     logger.info(
         "telemetry.processing_deferred_on_shutdown",
         extra={

@@ -10,8 +10,13 @@ import logging
 from datetime import datetime, timezone
 
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
-from telemetry_contract import CONSUMER_GROUP_NAME, DEADLETTER_STREAM_NAME, STREAM_NAME
+from redis.exceptions import RedisError, ResponseError
+from telemetry_contract import (
+    CONSUMER_GROUP_NAME,
+    DEADLETTER_STREAM_NAME,
+    STATE_UPDATE_CHANNEL_NAME,
+    STREAM_NAME,
+)
 
 logger = logging.getLogger("worker.stream")
 
@@ -82,6 +87,26 @@ async def ack(redis: Redis, message_id: str) -> None:
     await redis.xack(STREAM_NAME, CONSUMER_GROUP_NAME, message_id)
 
 
+async def stream_lag(redis: Redis) -> int | None:
+    """How many entries are sitting in telemetry.raw that this consumer
+    group hasn't been delivered yet — XINFO GROUPS' own `lag` field, the
+    same number `redis-cli XINFO GROUPS telemetry.raw` shows an operator
+    by hand. Used to drive the backlog gauge in worker/metrics.py
+    (docs/IMPROVEMENTS.md, "real observability") rather than recomputing
+    it some other way — one definition of "how far behind", used both by
+    a human at a terminal and by this process's own metrics.
+
+    None (not 0) if the group doesn't exist yet or the server's reply
+    doesn't include `lag` (older Redis) — the caller decides what to do
+    with "unknown" rather than this function guessing it means zero.
+    """
+    groups = await redis.xinfo_groups(STREAM_NAME)
+    for group in groups:
+        if group.get("name") == CONSUMER_GROUP_NAME:
+            return group.get("lag")
+    return None
+
+
 async def send_to_deadletter(
     redis: Redis, original_message_id: str, fields: dict, reason: str
 ) -> str:
@@ -117,3 +142,26 @@ async def send_to_deadletter(
         },
     )
     return entry_id
+
+
+async def publish_state_update(redis: Redis, payload: str) -> None:
+    """Best-effort live feed for GET /api/v1/stream (docs/IMPROVEMENTS.md,
+    "live state stream") — called only *after* a message is already
+    durably stored and acked (worker/processing.py), so this can never be
+    on the path that decides whether a message is safe to ack.
+
+    A publish failure (Redis blip, or Redis briefly unreachable) is
+    swallowed here, not raised: nothing durable depends on this, and the
+    one rule this module exists to protect (redis_stream.py's own
+    module docstring: a message is never acked before it's stored) must
+    never be put at risk by an optional side channel. A subscriber that
+    misses an update because of this simply sees the next one, or calls
+    GET .../latest to catch up.
+    """
+    try:
+        await redis.publish(STATE_UPDATE_CHANNEL_NAME, payload)
+    except RedisError as exc:
+        logger.warning(
+            "telemetry.state_update_publish_failed",
+            extra={"event": "telemetry.state_update_publish_failed", "reason": str(exc)},
+        )

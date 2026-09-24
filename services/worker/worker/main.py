@@ -12,14 +12,16 @@ import asyncio
 import logging
 import signal
 
+from prometheus_client import start_http_server
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
 
 from .config import get_settings
 from .db import bootstrap_schema, create_pool
 from .logging_config import configure_logging
+from .metrics import STREAM_BACKLOG
 from .processing import next_backoff_seconds, process_message
-from .redis_stream import claim_stale_pending, ensure_consumer_group, read_new
+from .redis_stream import claim_stale_pending, ensure_consumer_group, read_new, stream_lag
 
 logger = logging.getLogger("worker")
 
@@ -49,6 +51,28 @@ async def run(shutdown_event: asyncio.Event) -> None:
     await bootstrap_schema(pool)
     await ensure_consumer_group(redis)
 
+    # prometheus_client's own tiny WSGI server, in a background thread —
+    # no route to wire up, since this process (unlike api) has no HTTP
+    # framework of its own (docs/IMPROVEMENTS.md, "real observability").
+    # A bound-port failure (in production: something else already on
+    # settings.metrics_port; in tests: run() started a second time in
+    # the same process — see test_worker_redis_unavailable_recovery.py
+    # and test_worker_consumer_group_recovery.py, which both run a real
+    # worker.main.run() loop) is logged, not fatal: metrics are
+    # observability, and losing them must never stop this process from
+    # doing its actual job of processing telemetry.
+    try:
+        start_http_server(settings.metrics_port)
+    except OSError as exc:
+        logger.warning(
+            "worker.metrics_server_failed",
+            extra={
+                "event": "worker.metrics_server_failed",
+                "port": settings.metrics_port,
+                "reason": str(exc),
+            },
+        )
+
     logger.info(
         "worker.startup",
         extra={"event": "worker.startup", "consumer_name": settings.consumer_name},
@@ -58,6 +82,14 @@ async def run(shutdown_event: asyncio.Event) -> None:
     try:
         while not shutdown_event.is_set():
             try:
+                # Once per iteration (not per message) is enough for a
+                # gauge meant to answer "is a backlog building or
+                # draining right now", and keeps this off the hot path of
+                # every single message.
+                lag = await stream_lag(redis)
+                if lag is not None:
+                    STREAM_BACKLOG.set(lag)
+
                 reclaimed = await claim_stale_pending(
                     redis, settings.consumer_name, CLAIM_MIN_IDLE_MS
                 )

@@ -5,6 +5,7 @@ from .constants import (
     DEADLETTER_STREAM_NAME,
     DEFAULT_ASSET_OFFLINE_TIMEOUT_SECONDS,
     MAX_CLOCK_SKEW_SECONDS,
+    STATE_UPDATE_CHANNEL_NAME,
     STREAM_NAME,
 )
 from .models import AssetMode, AssetType, Position, TelemetryEvent
@@ -18,5 +19,6 @@ __all__ = [
     "DEADLETTER_STREAM_NAME",
     "DEFAULT_ASSET_OFFLINE_TIMEOUT_SECONDS",
     "MAX_CLOCK_SKEW_SECONDS",
+    "STATE_UPDATE_CHANNEL_NAME",
     "STREAM_NAME",
 ]

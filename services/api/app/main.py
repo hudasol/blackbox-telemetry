@@ -24,7 +24,8 @@ from redis.asyncio import Redis
 
 from .config import Settings, get_settings
 from .logging_config import configure_logging
-from .routers import deadletter, health, ingest, query
+from .metrics import INGEST_EVENTS_TOTAL
+from .routers import deadletter, health, ingest, metrics, query, stream
 
 logger = logging.getLogger("api")
 
@@ -70,6 +71,10 @@ async def _validation_exception_handler(
         if is_body_error
         else ("invalid_request", "request.rejected")
     )
+    if is_body_error:
+        # Only a rejected *telemetry event* counts here — a bad query
+        # param (e.g. GET .../history?limit=0) isn't an ingest outcome.
+        INGEST_EVENTS_TOTAL.labels(outcome="rejected").inc()
 
     logger.warning(
         log_event,
@@ -119,6 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(query.router)
     app.include_router(health.router)
     app.include_router(deadletter.router)
+    app.include_router(metrics.router)
+    app.include_router(stream.router)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     return app
 

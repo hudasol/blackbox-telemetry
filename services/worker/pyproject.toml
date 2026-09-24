@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "redis>=5.0",
     "asyncpg>=0.29",
+    "prometheus-client>=0.20",
 ]
 # telemetry-contract (../../libs/telemetry_contract) is a workspace-local
 # package, installed separately rather than declared here — see

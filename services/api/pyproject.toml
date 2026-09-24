@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "redis>=5.0",
     "asyncpg>=0.29",
+    "prometheus-client>=0.20",
 ]
 # telemetry-contract (../../libs/telemetry_contract) is a workspace-local
 # package, not a published one — it's installed separately (`pip install

@@ -16,6 +16,7 @@ class Settings:
     postgres_dsn: str
     log_level: str
     consumer_name: str
+    metrics_port: int
 
 
 def get_settings() -> Settings:
@@ -31,4 +32,9 @@ def get_settings() -> Settings:
         # work group-wide regardless of which consumer name originally
         # read it (see redis_stream.py).
         consumer_name=os.environ.get("WORKER_CONSUMER_NAME", socket.gethostname()),
+        # Separate port from the api's /metrics (which lives on 8000 with
+        # everything else): the worker has no HTTP framework of its own,
+        # so prometheus_client runs its own tiny server here instead of
+        # this process growing a whole web layer just to expose one path.
+        metrics_port=int(os.environ.get("WORKER_METRICS_PORT", "9100")),
     )

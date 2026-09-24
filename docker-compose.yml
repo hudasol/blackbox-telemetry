@@ -87,6 +87,11 @@ services:
       # (worker/config.py) — fine for D5's "one active worker for now",
       # and avoids every replica racing to claim the same fixed name if
       # this is ever scaled with `--scale worker=N`.
+    ports:
+      # Prometheus text exposition (docs/IMPROVEMENTS.md, "real
+      # observability") — a separate port from api's /metrics because
+      # this process has no HTTP framework of its own to add a route to.
+      - "9100:9100"
     depends_on:
       postgres:
         condition: service_healthy

@@ -39,3 +39,15 @@ CONSUMER_GROUP_NAME = "worker-group"
 # (XADD/XRANGE/XDEL) they already use elsewhere, with no new dependency
 # and no schema change. See docs/IMPROVEMENTS.md, poison-message handling.
 DEADLETTER_STREAM_NAME = "telemetry.deadletter"
+
+# Pub/Sub, not a Stream: this is a best-effort live feed for GET
+# /api/v1/stream (SSE), published *after* a message is already durably
+# stored and acked — nothing durable depends on it, so it deliberately
+# uses the primitive with no persistence and no consumer group instead of
+# one with both. A publish with zero subscribers is simply dropped, which
+# is exactly the behaviour wanted here: it can never build an unbounded
+# backlog, and a subscriber that misses an update just sees the next one
+# (or calls GET .../latest to catch up) instead of the worker's core
+# store-then-ack path ever waiting on it. See docs/IMPROVEMENTS.md, "live
+# state stream".
+STATE_UPDATE_CHANNEL_NAME = "telemetry.updates"
