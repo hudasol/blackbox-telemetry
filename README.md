@@ -7,7 +7,13 @@ built to fail predictably instead of quietly.
 
 Full design, data contract, and failure policy: [`docs/PLAN.md`](docs/PLAN.md).
 Build history, decisions, and every bug found along the way (and how it was
-found): [`docs/PROCESS_LOG.md`](docs/PROCESS_LOG.md).
+found): [`docs/PROCESS_LOG.md`](docs/PROCESS_LOG.md). Five additions beyond
+the baseline — poison-message handling, real observability, automated fault
+injection, a measured performance proof, and a live state stream — each
+tied to a specific engineering risk and backed by a real run, not a
+claim: [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md). Honest retrospective
+— what went wrong, bad assumptions, and what pre-submission checks
+missed: [`docs/RETROSPECTIVE.md`](docs/RETROSPECTIVE.md).
 
 ```
    simulators (test equipment, not part of the product)
@@ -129,6 +135,39 @@ docker compose up -d worker
 # dropped, nothing double-applied (idempotent insert + monotonic state).
 ```
 
+## Demonstrating the improvements
+
+Five additions beyond the baseline, each with a script or endpoint that
+proves it live rather than just describing it — full writeup with real
+numbers from an actual run: [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md).
+With the system up (first command above):
+
+```bash
+# Poison-message handling: inspect and replay a message the worker
+# could never parse, instead of it being silently discarded
+curl -s http://localhost:8000/api/v1/deadletter | python3 -m json.tool
+curl -s -X POST http://localhost:8000/api/v1/deadletter/<id>/replay
+
+# Real observability: Prometheus metrics (ingest outcomes/latency on the
+# api; processing outcomes/latency, DB retries, and stream backlog on
+# the worker, which serves its own separately since it has no HTTP
+# framework of its own)
+curl -s http://localhost:8000/metrics
+curl -s http://localhost:9100/metrics
+
+# Automated fault injection: SIGKILLs the real postgres container mid-
+# stream and proves zero data loss/duplication once it's back
+./scripts/fault_injection_demo.sh
+
+# Performance proof: measured ingest latency/throughput vs. how fast the
+# worker actually drains the backlog — a measured bottleneck, not a guess
+python3 scripts/load_test.py --count 500 --concurrency 50
+
+# Live state stream: Server-Sent Events, updated the moment the worker
+# stores+acks a message (optionally filtered to one asset)
+curl -N "http://localhost:8000/api/v1/stream?asset_id=drone-01"
+```
+
 ## API reference
 
 All endpoints under `/api/v1`. Every response is JSON.
@@ -139,8 +178,12 @@ All endpoints under `/api/v1`. Every response is JSON.
 | `GET` | `/api/v1/assets` | List every known asset with its latest snapshot and computed `online` status. |
 | `GET` | `/api/v1/assets/{asset_id}/latest` | One asset's current snapshot. `404` if the asset has never sent anything. |
 | `GET` | `/api/v1/assets/{asset_id}/history?limit=N&from=...&to=...` | That asset's raw event history, newest first (`limit` 1–500, default 50). `from`/`to` (both optional, ISO 8601, inclusive) filter to everything between two timestamps; a naive value with no offset is treated as UTC. `limit` still applies as an upper bound even when a range is given. `from` after `to` is a `422`. An unknown asset is a valid empty result, not a `404`. |
+| `GET` | `/api/v1/stream?asset_id=...` | Live asset-state updates over Server-Sent Events — a real-time complement to polling `.../history`, not a replacement for it. `asset_id` (optional) filters to one asset. See `docs/IMPROVEMENTS.md`, "live state stream". |
+| `GET` | `/api/v1/deadletter?limit=N` | List messages the worker could never parse (newest first, `limit` 1–500, default 50) — preserved instead of discarded. See `docs/IMPROVEMENTS.md`, "poison-message handling". |
+| `POST` | `/api/v1/deadletter/{id}/replay` | Put one dead-lettered message back onto `telemetry.raw` for normal reprocessing, and remove it from the dead-letter list. `404` if the id isn't there. |
 | `GET` | `/health/live` | Always `200` if the process is up — no dependency checks. |
 | `GET` | `/health/ready` | `200` only if Redis *and* Postgres are both reachable right now; `503` otherwise, with a per-dependency `checks` breakdown. |
+| `GET` | `/metrics` | Prometheus text exposition for the api (ingest outcomes, ingest latency). The worker exposes its own separately on port `9100` (no HTTP framework of its own to add a route to). See `docs/IMPROVEMENTS.md`, "real observability". |
 
 Field-level shapes (request and response) are defined by the shared
 contract in `libs/telemetry_contract` and enforced identically on ingest;
@@ -200,7 +243,7 @@ bring in `pytest`, `pytest-asyncio`, `httpx`):
 pytest tests/ -v
 ```
 
-108 tests, all passing as of this step. If your Postgres/Redis run on
+123 tests, all passing as of this step. If your Postgres/Redis run on
 different ports or credentials, override with `POSTGRES_TEST_DSN` and
 `REDIS_TEST_URL` (defaults are in `tests/integration/conftest.py`):
 
@@ -222,12 +265,15 @@ without paying for a full multi-image build.
 
 ```
 libs/telemetry_contract/   shared event contract (pydantic model, constants)
-services/api/               ingest (POST /telemetry) + query + health — FastAPI
+services/api/               ingest (POST /telemetry) + query + health + deadletter + stream + metrics — FastAPI
 services/worker/            Redis stream -> Postgres, idempotent + crash-safe
 services/simulator/         fake fleet + fault injection (test equipment only)
+scripts/                    fault_injection_demo.sh, load_test.py — live proof for docs/IMPROVEMENTS.md
 tests/unit/                 pure-logic tests, no external services
 tests/integration/          real Postgres + real Redis, incl. failure cases
 docker-compose.yml          system + simulated fleet (kept as two separate commands)
 docs/PLAN.md                design: architecture, contract, failure policy
 docs/PROCESS_LOG.md         running build log — decisions, bugs found, fixes
+docs/IMPROVEMENTS.md        five additions beyond the baseline, each with real-run evidence
+docs/RETROSPECTIVE.md       honest account of mistakes, lessons, and pre-submission gaps
 ```

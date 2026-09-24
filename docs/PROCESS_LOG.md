@@ -704,3 +704,140 @@ non-empty after, and tears down with `--profile simulator`.
 No product code changed — this was entirely about the gap between what
 `docs/PLAN.md` said the architecture was and what the packaging around
 it actually enforced.
+
+## 2026-09-24 — Five improvements beyond the baseline
+
+After RETROSPECTIVE.md and the acceptance-check verification above, asked
+to actually build all five of the brief's "improvement options" (fault
+injection, observability, poison-message handling, performance proof,
+live state stream) rather than just plan how to demonstrate two of them.
+Full risk/evidence writeup with real numbers from live runs is in the
+new `docs/IMPROVEMENTS.md`; this entry is the build-log version —
+decisions made and what broke along the way.
+
+**Poison-message handling.** Added a second Redis stream,
+`telemetry.deadletter`, and `GET`/`POST .../deadletter/{id}/replay` on
+the api. Decision made early: a plain stream, not a consumer group or a
+Postgres table — a dead-letter table would mean the worker's write path
+now depends on two storage systems instead of one, for a feature whose
+whole point is "something about this message can't be trusted yet."
+Straightforward to build since it reuses Redis Streams primitives
+(`XADD`/`XRANGE`/`XDEL`) the worker and api already use elsewhere for
+`telemetry.raw` — no new client library, no new connection. Verified
+with `pytest` (11 new/extended tests) and then live against the running
+stack: hand-crafted a bad `XADD`, confirmed it showed up in
+`GET .../deadletter` with the real parse-error reason, replayed it, and
+watched it get dead-lettered *again* (still literally `"not valid
+json"` — replay doesn't fix content, it just gives it another chance) —
+kept that honest outcome in `docs/IMPROVEMENTS.md` rather than replaying
+something pre-fixed to make the demo look cleaner.
+
+**Real observability.** Added `prometheus_client` metrics to both
+services — four total, each picked to answer a specific question
+`docs/PLAN.md`'s own failure table implicitly promises an answer to
+(is the backlog draining, is Postgres actually flaky, etc.), not a
+generic dashboard-filler set. One real bug found while wiring this up:
+the worker has no HTTP framework, so `prometheus_client.start_http_server`
+runs its own tiny server on a fixed port (9100) at startup — and two
+existing tests (`test_worker_redis_unavailable_recovery.py`,
+`test_worker_consumer_group_recovery.py`) both call `worker.main.run()`
+directly as a real background task, so running the full suite hit
+`OSError: [Errno 98] Address already in use` on the second call in the
+same pytest process. Fixed by wrapping the `start_http_server` call in
+`try/except OSError`, logged as a warning and never fatal — which is
+also just the right production behavior independent of the test
+collision: losing the metrics server must never stop the worker doing
+its actual job. Verified with 6 new integration tests (asserting metric
+*deltas*, since `prometheus_client`'s registry is process-global and
+shared across the whole test run — asserting an absolute value would
+have been wrong the moment a second test file touched the same
+counter) and then live: `curl localhost:8000/metrics` and
+`curl localhost:9100/metrics` against the running stack, both serving
+real Prometheus text output.
+
+**Automated fault injection.** `scripts/fault_injection_demo.sh`
+SIGKILLs the real `postgres` container in the live `docker compose`
+stack and checks recovery against real HTTP responses and a real row
+count, not a mocked failure. One design correction made while writing
+it: the first draft used a fixed `sleep 1` after the kill before
+sending "during outage" traffic, assuming that was long enough — but
+`docker-compose.yml` already sets `restart: unless-stopped` on
+`postgres`, so Docker restarts it on its own, and a fixed sleep would
+have been racing against however fast that happened to be on a given
+run. Replaced the sleep with an actual wait-loop on `/health/ready`
+reporting unhealthy, so the script *proves* it caught the outage window
+instead of assuming it did. Ran it live: 16 events sent (8 before the
+kill, 8 during), zero lost, zero duplicated, worker logs showing
+exactly one `db_retry` before recovery (Postgres came back fast enough
+that only one message actually hit a failed attempt) — see
+`docs/IMPROVEMENTS.md` for the full log excerpt and an honest note
+about what a single-retry run does and doesn't prove.
+
+**Performance proof.** `scripts/load_test.py` sends N events at a
+configurable concurrency and measures ingest latency/throughput
+separately from how long the worker takes to fully drain that batch —
+deliberately two different measurements, not one, so a real bottleneck
+could be identified instead of assumed. Assumption going in was that
+the worker (one Postgres transaction per message, no internal
+concurrency in its read loop) would be the slower side. The actual
+measured result was the opposite: the worker drained 500 messages in
+under a second (1395/s at one concurrency level) while ingest itself
+was the limiting factor (245–357 req/s, latency getting *worse* going
+from 50 to 100 concurrent requests) — consistent with a single
+`uvicorn` process contending for this sandbox's 2 CPU cores, confirmed
+by sampling `docker stats` mid-run rather than just asserting it. Kept
+the wrong initial assumption and the real finding both in
+`docs/IMPROVEMENTS.md`, since "the bottleneck wasn't where I expected"
+is a more honest performance proof than one written to confirm a guess.
+
+**Live state stream.** `GET /api/v1/stream` (SSE), fed by the worker
+publishing to a Redis Pub/Sub channel right after its existing `ack()`
+call. Pub/Sub over a Stream was a deliberate choice, not the first
+thing tried by default: a Stream would need trimming or it grows
+forever, while Pub/Sub simply drops a publish with zero subscribers,
+so a slow or absent SSE client creates zero memory pressure on the
+worker or Redis — the property this feature most needed, given the
+explicit instruction not to weaken the reliability work already done.
+One real tooling problem hit while writing the integration test: httpx's
+`ASGITransport` (used for every other router's tests in this suite)
+turned out to buffer a `StreamingResponse`'s entire body before handing
+any of it back to the client — fine for finite responses, but it means
+a test against an endpoint that's designed to stream until the client
+disconnects just hangs forever, which is exactly what happened first
+(`pytest` timeout after 17s across all three new tests). Confirmed the
+cause with an isolated repro (a bare FastAPI app, printed progress
+inside the generator) before concluding it was a transport limitation
+and not a bug in the router — the repro showed the *entire* server-side
+generator running to completion before the client's `stream()` call
+even returned, which only makes sense if the transport isn't handing
+data back incrementally. Rewrote the tests to drive the router's
+generator function directly instead (still against real Redis Pub/Sub
+and the real worker publish call site — only the HTTP layer itself is
+skipped); documented why in that test file's module docstring so the
+next person doesn't hit the same 17-second hang wondering what's wrong.
+Verified live too: `curl -N` against the running stack, `POST`ed one
+event, watched it arrive on the SSE connection with the correct
+`outcome`.
+
+**What didn't change:** none of the five additions touch the
+store-before-ack rule `docs/PLAN.md` and `worker/processing.py`'s own
+module docstring both call the one rule that module exists to enforce.
+Each one was checked against that rule specifically before being
+considered done — dead-letter write happens before the ack it replaces;
+metrics recording happens after the ack (or after the dead-letter path,
+for that case) and can't fail it; the state-update publish happens
+after ack and swallows its own errors; the fault-injection script and
+load test only ever call the public API, never touch worker internals.
+
+Full test suite after all five: 123 passing (108 baseline + 6
+poison-message + 6 metrics + 3 stream — the fault-injection and
+load-test evidence lives in `docs/IMPROVEMENTS.md` instead of the test
+suite, since those two are live demonstrations against a running stack
+rather than repeatable pytest cases).
+Updated to match: `README.md` (API reference table, a new
+"Demonstrating the improvements" section, `docs/IMPROVEMENTS.md` and
+`docs/RETROSPECTIVE.md` linked from the top, repository layout, test
+count); `docker-compose.yml` (worker's `9100` metrics port exposed);
+both `services/api/pyproject.toml` and `services/worker/pyproject.toml`
+(`prometheus-client` added as a real declared dependency, not just
+installed ad hoc in the dev venv).
