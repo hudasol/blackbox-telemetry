@@ -7,10 +7,11 @@ mechanics of getting messages don't tangle with what happens to them.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
-from telemetry_contract import CONSUMER_GROUP_NAME, STREAM_NAME
+from telemetry_contract import CONSUMER_GROUP_NAME, DEADLETTER_STREAM_NAME, STREAM_NAME
 
 logger = logging.getLogger("worker.stream")
 
@@ -79,3 +80,40 @@ async def read_new(
 
 async def ack(redis: Redis, message_id: str) -> None:
     await redis.xack(STREAM_NAME, CONSUMER_GROUP_NAME, message_id)
+
+
+async def send_to_deadletter(
+    redis: Redis, original_message_id: str, fields: dict, reason: str
+) -> str:
+    """Preserve a message this worker can never successfully process,
+    instead of discarding it on ack (docs/PLAN.md's old "known
+    limitation" — see docs/IMPROVEMENTS.md, poison-message handling).
+
+    A plain stream, not a consumer group: nothing auto-reads this one, an
+    operator decides when to act on it. The original telemetry.raw
+    message_id and fields are kept as-is (not re-parsed or reshaped) so
+    replay_to_raw below can put exactly the same bytes back, and so a
+    human inspecting this can see precisely what the worker saw.
+    """
+    entry_id = await redis.xadd(
+        DEADLETTER_STREAM_NAME,
+        {
+            "original_message_id": original_message_id,
+            "original_asset_id": fields.get("asset_id", ""),
+            "original_seq": fields.get("seq", ""),
+            "payload": fields.get("payload", ""),
+            "received_at": fields.get("received_at", ""),
+            "reason": reason,
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.error(
+        "telemetry.deadlettered",
+        extra={
+            "event": "telemetry.deadlettered",
+            "original_message_id": original_message_id,
+            "deadletter_id": entry_id,
+            "reason": reason,
+        },
+    )
+    return entry_id

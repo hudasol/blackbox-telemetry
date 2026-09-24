@@ -24,7 +24,7 @@ from redis.asyncio import Redis
 
 from .config import Settings, get_settings
 from .logging_config import configure_logging
-from .routers import health, ingest, query
+from .routers import deadletter, health, ingest, query
 
 logger = logging.getLogger("api")
 
@@ -118,6 +118,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(query.router)
     app.include_router(health.router)
+    app.include_router(deadletter.router)
     app.add_exception_handler(RequestValidationError, _validation_exception_handler)
     return app
 

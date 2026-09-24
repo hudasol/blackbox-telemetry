@@ -32,3 +32,10 @@ MIN_SEQ = 0
 # service (see docs/PLAN.md, architecture / decision D5).
 STREAM_NAME = "telemetry.raw"
 CONSUMER_GROUP_NAME = "worker-group"
+
+# A separate stream, not a consumer group on telemetry.raw, and not a
+# Postgres table: worker (writer, on a poison message) and api (reader,
+# for inspect/replay) both only need plain Redis Streams commands
+# (XADD/XRANGE/XDEL) they already use elsewhere, with no new dependency
+# and no schema change. See docs/IMPROVEMENTS.md, poison-message handling.
+DEADLETTER_STREAM_NAME = "telemetry.deadletter"

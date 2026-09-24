@@ -16,7 +16,7 @@ from pydantic import ValidationError
 from telemetry_contract import TelemetryEvent
 
 from . import db
-from .redis_stream import ack
+from .redis_stream import ack, send_to_deadletter
 
 logger = logging.getLogger("worker.processing")
 
@@ -59,18 +59,13 @@ async def process_message(
         # event before enqueueing it. If it does (a bug, a schema change,
         # a hand-crafted stream entry), it's a poison message: retrying it
         # forever would just wedge the stream on something that can never
-        # succeed. Full dead-letter handling (inspect/replay) is an
-        # exceeds-the-bar item; for now this is logged loudly and acked
-        # so it doesn't block everything behind it — see docs/PLAN.md,
-        # "known limitation".
-        logger.error(
-            "telemetry.payload_unparseable",
-            extra={
-                "event": "telemetry.payload_unparseable",
-                "message_id": message_id,
-                "reason": str(exc),
-            },
-        )
+        # succeed, so it still gets acked off telemetry.raw immediately.
+        # Unlike the old behavior, it isn't just discarded: the exact
+        # original bytes are preserved on a dead-letter stream first, so
+        # an operator can see what came in and replay it (as-is, or after
+        # a fix elsewhere) instead of it being silently gone forever. See
+        # docs/IMPROVEMENTS.md, poison-message handling.
+        await send_to_deadletter(redis, message_id, fields, reason=str(exc))
         await ack(redis, message_id)
         return
 
