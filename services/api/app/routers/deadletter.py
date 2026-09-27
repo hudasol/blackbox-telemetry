@@ -27,6 +27,36 @@ logger = logging.getLogger("api.deadletter")
 LIST_DEFAULT_LIMIT = 50
 LIST_MAX_LIMIT = 500
 
+# Replay used to be two separate round-trips — XADD onto telemetry.raw,
+# then XDEL off telemetry.deadletter — with nothing tying them together.
+# A Redis blip between them left a message live on telemetry.raw while
+# still listed as dead-lettered, so a retried replay request re-added it
+# a second time; two concurrent replays of the same id raced the same
+# way with no blip needed at all, since XRANGE doesn't remove what it
+# reads. A Lua script makes "is it still there, move it, remove it" one
+# atomic operation on the server: it either runs to completion (moved
+# and removed) or doesn't run at all (untouched) — no window where only
+# half of it happened, and a second caller's script sees the entry
+# already gone and cleanly no-ops instead of re-enqueuing it.
+_REPLAY_SCRIPT = """
+local entries = redis.call('XRANGE', KEYS[2], ARGV[1], ARGV[1])
+if #entries == 0 then
+    return false
+end
+local raw = entries[1][2]
+local fields = {}
+for i = 1, #raw, 2 do
+    fields[raw[i]] = raw[i + 1]
+end
+local new_id = redis.call('XADD', KEYS[1], '*',
+    'asset_id', fields['original_asset_id'] or '',
+    'seq', fields['original_seq'] or '',
+    'received_at', fields['received_at'] or '',
+    'payload', fields['payload'] or '')
+redis.call('XDEL', KEYS[2], ARGV[1])
+return {new_id, fields['original_message_id'] or ''}
+"""
+
 
 def _entry_to_dict(entry_id: str, fields: dict) -> dict:
     # payload is kept as the original raw JSON string (send_to_deadletter
@@ -93,14 +123,15 @@ async def replay_deadletter(deadletter_id: str, request: Request):
     meantime. Either way, if it fails again, it gets dead-lettered again
     — safe, since each replay is one deliberate action, not an automatic
     retry loop.
+
+    The lookup, the re-enqueue, and the removal all happen inside one
+    Lua script (_REPLAY_SCRIPT) so they're atomic on the server — see
+    that script's own comment for why.
     """
     redis = request.app.state.redis
     try:
-        # XRANGE with the same id as both bounds fetches exactly that one
-        # entry — the documented way to look up a single Stream entry by
-        # id without scanning the whole stream.
-        found = await redis.xrange(
-            DEADLETTER_STREAM_NAME, min=deadletter_id, max=deadletter_id
+        result = await redis.eval(
+            _REPLAY_SCRIPT, 2, STREAM_NAME, DEADLETTER_STREAM_NAME, deadletter_id
         )
     except RedisError as exc:
         logger.error(
@@ -119,30 +150,24 @@ async def replay_deadletter(deadletter_id: str, request: Request):
             },
         )
 
-    if not found:
+    if not result:
+        # Either it never existed, or it was already replayed — by this
+        # same request retried, or by a concurrent one — and the script
+        # correctly no-op'd rather than enqueueing it a second time.
+        # Both look identical from the caller's side: there is nothing
+        # left at this id to replay.
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"error": "deadletter_entry_not_found", "deadletter_id": deadletter_id},
         )
 
-    _entry_id, fields = found[0]
-    new_stream_id = await redis.xadd(
-        STREAM_NAME,
-        {
-            "asset_id": fields.get("original_asset_id", ""),
-            "seq": fields.get("original_seq", ""),
-            "received_at": fields.get("received_at", ""),
-            "payload": fields.get("payload", ""),
-        },
-    )
-    await redis.xdel(DEADLETTER_STREAM_NAME, deadletter_id)
-
+    new_stream_id, original_message_id = result
     logger.info(
         "deadletter.replayed",
         extra={
             "event": "deadletter.replayed",
             "deadletter_id": deadletter_id,
-            "original_message_id": fields.get("original_message_id"),
+            "original_message_id": original_message_id or None,
             "new_message_id": new_stream_id,
         },
     )

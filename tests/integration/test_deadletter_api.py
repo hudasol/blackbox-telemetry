@@ -4,6 +4,7 @@ real Redis, same pattern as test_query_api.py's _client_for helper.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -131,3 +132,50 @@ async def test_replay_of_unknown_id_is_404(api_client):
     response = await api_client.post("/api/v1/deadletter/9999999999999-0/replay")
     assert response.status_code == 404
     assert response.json()["error"] == "deadletter_entry_not_found"
+
+
+async def test_replaying_the_same_id_twice_does_not_duplicate_the_message(
+    api_client, redis_client
+):
+    """The bug this closes: replay used to be XADD-then-XDEL as two
+    separate round-trips, so a retried replay request (the client didn't
+    see the first response, or just double-clicked) could re-enqueue the
+    same dead-lettered message a second time before the first XDEL ever
+    removed it. The lookup, XADD, and XDEL are now one atomic script, so
+    a second replay of an already-replayed id must see nothing there —
+    not a second copy on telemetry.raw."""
+    entry_id = await _add_deadletter_entry(redis_client, original_seq="9")
+
+    first = await api_client.post(f"/api/v1/deadletter/{entry_id}/replay")
+    assert first.status_code == 200
+
+    second = await api_client.post(f"/api/v1/deadletter/{entry_id}/replay")
+    assert second.status_code == 404
+    assert second.json()["error"] == "deadletter_entry_not_found"
+
+    # Exactly one copy on telemetry.raw, not two.
+    raw_entries = await redis_client.xrange(STREAM_NAME)
+    assert len(raw_entries) == 1
+
+
+async def test_concurrent_replay_of_the_same_id_only_replays_once(
+    api_client, redis_client
+):
+    """Same bug, the race-without-any-blip version: two requests for the
+    same deadletter_id arriving at the same time both used to pass the
+    XRANGE lookup (it doesn't remove anything) and both XADD — two
+    messages on telemetry.raw from one dead-lettered entry. The atomic
+    script serializes them on the server: whichever runs first sees the
+    entry and moves it, the other sees it already gone."""
+    entry_id = await _add_deadletter_entry(redis_client, original_seq="9")
+
+    responses = await asyncio.gather(
+        api_client.post(f"/api/v1/deadletter/{entry_id}/replay"),
+        api_client.post(f"/api/v1/deadletter/{entry_id}/replay"),
+    )
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses == [200, 404]
+
+    raw_entries = await redis_client.xrange(STREAM_NAME)
+    assert len(raw_entries) == 1
+    assert await redis_client.xrange(DEADLETTER_STREAM_NAME) == []

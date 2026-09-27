@@ -149,3 +149,54 @@ def test_unknown_extra_fields_are_preserved_not_interpreted():
 def test_no_extra_fields_returns_empty_dict():
     event = TelemetryEvent(**make_payload())
     assert event.extra_fields() == {}
+
+
+# --- Values that parse as valid JSON but can never be written to
+# Postgres: a NUL byte isn't representable in TEXT/JSONB at all, and
+# NaN/Infinity is accepted by json.dumps but rejected by Postgres's
+# strict jsonb parser. Both must be rejected here, at the contract, so
+# they're a normal validation failure (422 at ingest, dead-lettered at
+# the worker) instead of reaching the database and failing there —
+# permanently, on every retry, since the bytes never change. ---
+
+
+def test_asset_id_with_nul_byte_is_rejected():
+    with pytest.raises(ValidationError):
+        TelemetryEvent(**make_payload(asset_id="drone\x00-01"))
+
+
+def test_asset_id_without_nul_byte_is_accepted():
+    TelemetryEvent(**make_payload(asset_id="drone-01"))
+
+
+@pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+def test_extra_field_non_finite_number_is_rejected(bad_value):
+    with pytest.raises(ValidationError):
+        TelemetryEvent(**make_payload(rssi=bad_value))
+
+
+def test_extra_field_with_nul_byte_string_is_rejected():
+    with pytest.raises(ValidationError):
+        TelemetryEvent(**make_payload(firmware_version="1.2.3\x00"))
+
+
+def test_extra_field_nested_non_finite_number_is_rejected():
+    # extra="allow" fields can be arbitrarily nested JSON (a dict or list
+    # value, not just a scalar) — the check has to recurse into those,
+    # not just look at top-level values.
+    with pytest.raises(ValidationError):
+        TelemetryEvent(**make_payload(diagnostics={"imu": {"drift": math.nan}}))
+    with pytest.raises(ValidationError):
+        TelemetryEvent(**make_payload(readings=[1.0, 2.0, math.inf]))
+
+
+def test_extra_field_finite_numbers_and_clean_strings_are_accepted():
+    event = TelemetryEvent(
+        **make_payload(
+            firmware_version="1.2.3",
+            signal_dbm=-67,
+            diagnostics={"imu": {"drift": 0.01}},
+            readings=[1.0, 2.0, 3.0],
+        )
+    )
+    assert event.extra_fields()["diagnostics"] == {"imu": {"drift": 0.01}}

@@ -115,6 +115,35 @@ async def process_message(
             except asyncio.TimeoutError:
                 pass
             continue
+        except (ValueError, UnicodeError) as exc:
+            # A client-side encoding failure — asyncpg rejecting a NUL
+            # byte, or json.dumps(allow_nan=False) rejecting a
+            # non-finite float — happens before any query reaches
+            # Postgres, so it's never an asyncpg.PostgresError and never
+            # transient: the exact same bytes fail the exact same way on
+            # every retry. telemetry_contract.TelemetryEvent already
+            # rejects both cases at validation time (above), so this
+            # should be unreachable in practice; it exists so a gap
+            # there degrades to "one message dead-lettered" instead of
+            # "this message retries forever and wedges everything behind
+            # it" or, worse, an uncaught exception that crashes the
+            # worker and gets the same message reclaimed and crashed on
+            # again at every restart.
+            logger.error(
+                "telemetry.store_permanently_failed",
+                extra={
+                    "event": "telemetry.store_permanently_failed",
+                    "asset_id": event.asset_id,
+                    "seq": event.seq,
+                    "message_id": message_id,
+                    "reason": str(exc),
+                },
+            )
+            await send_to_deadletter(redis, message_id, fields, reason=str(exc))
+            await ack(redis, message_id)
+            MESSAGES_PROCESSED_TOTAL.labels(outcome="deadlettered").inc()
+            PROCESSING_LATENCY_SECONDS.observe(time.monotonic() - started_at)
+            return
 
         logger.info(
             "telemetry.stored",

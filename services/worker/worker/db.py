@@ -160,7 +160,15 @@ async def store_event(
             event.temperature_c,
             event.link_quality_pct,
             event.mode.value,
-            json.dumps(event.extra_fields()),
+            # allow_nan=False: fail fast with a ValueError here rather
+            # than silently emitting non-standard NaN/Infinity tokens
+            # that json.dumps allows by default but Postgres's strict
+            # jsonb parser rejects — same failure, but raised on our own
+            # terms instead of surfacing as an opaque PostgresError.
+            # telemetry_contract.TelemetryEvent already rejects these
+            # (and embedded NUL bytes) at validation time; this is the
+            # backstop for anything that reaches here anyway.
+            json.dumps(event.extra_fields(), allow_nan=False),
         )
         advanced_asset_id = await conn.fetchval(
             _UPSERT_STATE_SQL,

@@ -5,6 +5,7 @@ that ties Redis Streams, Postgres, and the retry/ack rules together.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -159,6 +160,103 @@ async def test_deadletter_replay_puts_the_message_back_for_reprocessing(
     )
     assert row is not None  # the replayed event landed
     assert await redis_client.xrange(DEADLETTER_STREAM_NAME) == []  # and is gone from dead-letter
+
+
+async def test_nul_byte_asset_id_is_deadlettered_at_parse_not_crashed(
+    pg_pool, redis_client
+):
+    """A NUL byte in asset_id used to pass validation untouched and only
+    fail once db.store_event tried to write it — as a plain ValueError
+    from asyncpg that nothing caught, crashing the worker outright (and,
+    since the message was never acked, crashing it again on every
+    restart once claim_stale_pending reclaimed it). It's now rejected by
+    telemetry_contract.TelemetryEvent itself, so process_message's
+    existing parse-validation dead-letter path catches it like any other
+    malformed message — before ever touching Postgres."""
+    await ensure_consumer_group(redis_client)
+    bad_payload = json.dumps({**valid_payload(), "asset_id": "drone\x00-01"})
+    await redis_client.xadd(STREAM_NAME, {"payload": bad_payload})
+    response = await redis_client.xreadgroup(
+        "worker-group", "test-consumer", {STREAM_NAME: ">"}, count=1
+    )
+    _stream, messages = response[0]
+    message_id, fields = messages[0]
+
+    await process_message(
+        redis_client, pg_pool, message_id, fields, asyncio.Event()
+    )
+
+    pending = await redis_client.xpending(STREAM_NAME, "worker-group")
+    assert pending["pending"] == 0  # acked, not crashed and not stuck
+
+    count = await pg_pool.fetchval("SELECT count(*) FROM telemetry_events")
+    assert count == 0  # never reached the database
+
+    deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
+    assert len(deadlettered) == 1
+    assert deadlettered[0][1]["original_message_id"] == message_id
+
+
+async def test_non_finite_extra_field_is_deadlettered_at_parse_not_retried_forever(
+    pg_pool, redis_client
+):
+    """Same failure class as the NUL-byte case, for extra="allow"
+    fields: a NaN/Infinity used to serialize fine (json.dumps allows it
+    by default) and only fail at Postgres's strict jsonb parser — on
+    every retry, identically, since the payload never changes. Now
+    rejected at parse time instead, so it's one dead-lettered message,
+    not an unbounded retry loop blocking every message behind it (the
+    worker processes one at a time)."""
+    await ensure_consumer_group(redis_client)
+    bad_payload = json.dumps({**valid_payload(), "signal_dbm": float("nan")})
+    await redis_client.xadd(STREAM_NAME, {"payload": bad_payload})
+    response = await redis_client.xreadgroup(
+        "worker-group", "test-consumer", {STREAM_NAME: ">"}, count=1
+    )
+    _stream, messages = response[0]
+    message_id, fields = messages[0]
+
+    await process_message(
+        redis_client, pg_pool, message_id, fields, asyncio.Event()
+    )
+
+    pending = await redis_client.xpending(STREAM_NAME, "worker-group")
+    assert pending["pending"] == 0
+    count = await pg_pool.fetchval("SELECT count(*) FROM telemetry_events")
+    assert count == 0
+    deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
+    assert len(deadlettered) == 1
+
+
+async def test_store_time_value_error_is_deadlettered_not_retried_forever(
+    pg_pool, redis_client, monkeypatch
+):
+    """Defense-in-depth: even if a ValueError somehow reaches
+    db.store_event (the contract validation above should prevent this
+    in practice — this simulates a gap in it), the worker must treat it
+    as permanent — dead-letter and move on — never retry it forever
+    (wedging the queue) and never let it propagate uncaught (crashing
+    the worker, which would just reprocess and crash again on the next
+    restart)."""
+    await enqueue(redis_client, seq=1)
+    message_id, fields = await read_one(redis_client)
+
+    async def always_raises_value_error(pool, event, received_at):
+        raise ValueError("simulated client-side encoding failure")
+
+    monkeypatch.setattr(db, "store_event", always_raises_value_error)
+
+    await process_message(
+        redis_client, pg_pool, message_id, fields, asyncio.Event()
+    )
+
+    pending = await redis_client.xpending(STREAM_NAME, "worker-group")
+    assert pending["pending"] == 0  # acked, not left retrying forever
+    count = await pg_pool.fetchval("SELECT count(*) FROM telemetry_events")
+    assert count == 0
+    deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
+    assert len(deadlettered) == 1
+    assert deadlettered[0][1]["original_message_id"] == message_id
 
 
 async def test_duplicate_message_is_acked_without_a_second_row(pg_pool, redis_client):
