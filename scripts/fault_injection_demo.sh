@@ -86,7 +86,17 @@ log "step 2/6: SIGKILL-ing the postgres container"
 # before trusting that the next block's requests land inside it, rather
 # than guessing with a fixed sleep.
 is_not_ready() { ! curl -sf "$API/health/ready" >/dev/null 2>&1; }
-wait_for "Postgres outage is visible via /health/ready" 15 is_not_ready
+# `|| true`, not a bare call: wait_for already records a timeout via
+# fail() (bumping FAILURES) and returns 1 — under `set -e`, a bare call
+# whose result nothing checks aborts the whole script right there, same
+# as any other failing command would. That would skip step 3 onward,
+# including the one check this script exists to make (step 6, whether
+# every event survived the outage) — postgres was already SIGKILLed
+# above regardless of what /health/ready reports, so the in-outage
+# traffic below still exercises a real outage even if this particular
+# check timed out. The timeout itself is still recorded and still fails
+# the run at the bottom; only the early exit is what's being avoided.
+wait_for "Postgres outage is visible via /health/ready" 15 is_not_ready || true
 
 log "step 3/6: sending $DURING_COUNT more events while Postgres is unreachable"
 during_start=$((BEFORE_COUNT + 1))
@@ -109,7 +119,14 @@ fi
 
 log "step 5/6: restarting postgres"
 (cd "$(dirname "$0")/.." && docker compose start postgres)
-wait_for "api became ready again" 60 curl -sf "$API/health/ready"
+# Same reasoning as step 2's wait_for above: `|| true` so a slow restart
+# (timeout already recorded via fail() inside wait_for) doesn't trip
+# `set -e` and abort before step 6 — the actual zero-data-loss check,
+# and the entire reason this script exists. The worker keeps draining
+# its backlog once postgres does come back regardless of how long the
+# readiness probe took to notice, so step 6 below is still a meaningful
+# check even after a slow-to-recover postgres.
+wait_for "api became ready again" 60 curl -sf "$API/health/ready" || true
 
 log "step 6/6: waiting for the worker to drain its backlog and store all $TOTAL events"
 check_count() {
