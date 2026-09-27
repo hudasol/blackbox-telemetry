@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import asyncpg
 import httpx
+import pytest
 import pytest_asyncio
 from app.config import Settings
 from app.main import create_app
@@ -130,6 +131,42 @@ async def test_replay_puts_the_message_back_on_telemetry_raw_and_removes_it(
 
 async def test_replay_of_unknown_id_is_404(api_client):
     response = await api_client.post("/api/v1/deadletter/9999999999999-0/replay")
+    assert response.status_code == 404
+    assert response.json()["error"] == "deadletter_entry_not_found"
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "not-an-id",
+        "12345",  # missing -seq
+        "12345-",  # missing seq value
+        "-0",  # missing ms value
+        "12345-0-0",  # extra segment
+        "abc-def",
+        "-1-0",  # negative
+        "12.5-0",  # not an integer
+    ],
+)
+async def test_replay_of_malformed_id_is_400_not_503(api_client, bad_id):
+    """The bug this closes: an id that isn't Redis's <ms>-<seq> stream-id
+    shape used to reach XRANGE, which rejects it with a ResponseError —
+    a RedisError subclass caught by the same except block as an actual
+    Redis outage, so a client typo came back indistinguishable from a
+    real 503. It's now checked before Redis is ever touched."""
+    response = await api_client.post(f"/api/v1/deadletter/{bad_id}/replay")
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "invalid_deadletter_id"
+    assert body["deadletter_id"] == bad_id
+
+
+async def test_replay_of_well_formed_but_nonexistent_id_is_still_404(api_client):
+    # A malformed id (above) and a well-formed-but-nonexistent one (this
+    # test, same as test_replay_of_unknown_id_is_404) are different
+    # problems and must stay distinguishable: 400 for "that's not a real
+    # id", 404 for "no entry at that id".
+    response = await api_client.post("/api/v1/deadletter/123456789-0/replay")
     assert response.status_code == 404
     assert response.json()["error"] == "deadletter_entry_not_found"
 

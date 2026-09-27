@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -26,6 +27,17 @@ logger = logging.getLogger("api.deadletter")
 
 LIST_DEFAULT_LIMIT = 50
 LIST_MAX_LIMIT = 500
+
+# Every real dead-letter id is a Redis Stream id in this exact shape —
+# it's what XADD generates and what list_deadletter above hands back
+# verbatim as "deadletter_id". Anything else (a typo, a stray path
+# segment, an id copied from somewhere else) can never be a real entry,
+# and XRANGE rejects it outright with "ERR Invalid stream ID..." — a
+# ResponseError, which is a RedisError subclass, so it used to fall into
+# the same except block as an actual Redis outage and come back as a
+# misleading 503. Checked here, before Redis is ever touched, so a
+# malformed id is reported as what it is instead.
+_DEADLETTER_ID_PATTERN = re.compile(r"^[0-9]+-[0-9]+$")
 
 # Replay used to be two separate round-trips — XADD onto telemetry.raw,
 # then XDEL off telemetry.deadletter — with nothing tying them together.
@@ -128,6 +140,26 @@ async def replay_deadletter(deadletter_id: str, request: Request):
     Lua script (_REPLAY_SCRIPT) so they're atomic on the server — see
     that script's own comment for why.
     """
+    if not _DEADLETTER_ID_PATTERN.match(deadletter_id):
+        logger.warning(
+            "deadletter.replay_invalid_id",
+            extra={
+                "event": "deadletter.replay_invalid_id",
+                "deadletter_id": deadletter_id,
+            },
+        )
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": "invalid_deadletter_id",
+                "detail": (
+                    f"{deadletter_id!r} is not a valid dead-letter id "
+                    "(expected <ms>-<seq>, e.g. 1690000000000-0)"
+                ),
+                "deadletter_id": deadletter_id,
+            },
+        )
+
     redis = request.app.state.redis
     try:
         result = await redis.eval(
