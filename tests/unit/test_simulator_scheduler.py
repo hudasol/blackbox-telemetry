@@ -103,3 +103,68 @@ def test_only_one_event_is_held_at_a_time():
 
     assert [e["seq"] for e in second.to_send] == [2, 1]
     assert second.held is None
+
+
+def test_bad_data_and_out_of_order_can_both_fire_on_the_same_tick():
+    # Regression test: plan_tick used to return immediately once
+    # should_corrupt() fired, so should_reorder() was never even called
+    # on a tick where bad-data also fired — the two behaviors could
+    # never happen together. With both rates at 1.0, a fixed draw makes
+    # both switches fire on every tick, proving they now compose instead
+    # of one silently pre-empting the other.
+    asset = make_asset()
+    injector = FaultInjector(
+        FaultRates(bad_data=1.0, out_of_order=1.0), _FixedDraw(0.0)
+    )
+
+    first = plan_tick(asset, injector, held=None)
+    # Held back (out-of-order fired) *and* corrupted (bad-data fired) —
+    # previously this tick would have gone out immediately, corrupted,
+    # with the reorder roll never drawn at all.
+    assert first.to_send == []
+    assert first.held is not None
+    assert "_simulated_fault" in first.held
+
+    # Held is already occupied, so this tick can't start a second hold
+    # (same invariant as test_only_one_event_is_held_at_a_time) — it
+    # releases the corrupted held event alongside this tick's own
+    # (also corrupted) event.
+    second = plan_tick(asset, injector, held=first.held)
+    assert [e["seq"] for e in second.to_send] == [2, 1]
+    assert all("_simulated_fault" in e for e in second.to_send)
+    assert second.held is None
+
+
+def test_out_of_order_rate_is_unaffected_by_bad_data_also_firing():
+    # Regression test: with the old should_corrupt()-short-circuits-
+    # should_reorder() control flow, cranking bad_data up to 1.0 would
+    # have suppressed the reorder roll on every single tick, driving the
+    # observed hold rate to 0 regardless of out_of_order_rate. It should
+    # instead land close to the configured rate, same as if bad_data
+    # were 0 — see test_observed_rate_is_close_to_the_configured_rate in
+    # test_simulator_faults.py for the same style of check one level
+    # down, on the raw should_reorder() draw.
+    out_of_order_rate = 0.3
+    tolerance = 0.04
+    samples = 4000
+
+    asset = make_asset()
+    injector = FaultInjector(
+        FaultRates(bad_data=1.0, out_of_order=out_of_order_rate),
+        random.Random(7),
+    )
+
+    opportunities = 0  # ticks where a hold could have started (held was free)
+    holds = 0
+    held: dict | None = None
+    for _ in range(samples):
+        was_free = held is None
+        plan = plan_tick(asset, injector, held=held)
+        if was_free:
+            opportunities += 1
+            if plan.held is not None:
+                holds += 1
+        held = plan.held
+
+    observed = holds / opportunities
+    assert abs(observed - out_of_order_rate) < tolerance

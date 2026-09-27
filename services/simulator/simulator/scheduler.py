@@ -39,20 +39,39 @@ def plan_tick(
         # computed from last_seen_at at read time (docs/PLAN.md, D3).
         return TickPlan(to_send=[], held=held)
 
-    if injector.should_corrupt():
-        # This tick's real data never reaches Postgres — the corrupted
-        # payload should bounce with a 422 and never be enqueued.
-        return TickPlan(to_send=[injector.corrupt(new_event)], held=held)
+    # Both remaining switches are drawn unconditionally here, every
+    # tick, regardless of what the other one rolled. They used to be
+    # checked with an early return on should_corrupt() — which meant a
+    # tick where bad-data fired never even called should_reorder(),
+    # silently suppressing SIM_OUT_OF_ORDER_RATE below its configured
+    # value whenever SIM_BAD_DATA_RATE was also > 0 (and, by the same
+    # bug in the other direction, would have suppressed
+    # SIM_BAD_DATA_RATE too had the checks been ordered the other way
+    # around). Drawing both every tick — before either one can
+    # influence whether the other is even evaluated — is what actually
+    # makes the four fault switches independent, as this module's own
+    # docstring already claims. See
+    # test_out_of_order_rate_is_unaffected_by_bad_data_also_firing and
+    # test_bad_data_and_out_of_order_can_both_fire_on_the_same_tick in
+    # tests/unit/test_simulator_scheduler.py.
+    is_corrupt = injector.should_corrupt()
+    wants_reorder = held is None and injector.should_reorder()
 
-    if held is None and injector.should_reorder():
+    # Bad-data and out-of-order are properties of the same event, not
+    # mutually exclusive outcomes — if both fire on this tick, the
+    # thing that eventually goes out (now, or later if it's held) is
+    # the corrupted version.
+    outgoing = injector.corrupt(new_event) if is_corrupt else new_event
+
+    if wants_reorder:
         # Hold this one back; it'll be released only after a later
         # (higher-seq) event has already gone out, so it arrives at the
         # API genuinely out of order rather than just delayed.
-        return TickPlan(to_send=[], held=new_event)
+        return TickPlan(to_send=[], held=outgoing)
 
     if held is not None:
         # Release the held (older-seq) event right after the current
         # (newer-seq) one — that ordering on the wire is the whole point.
-        return TickPlan(to_send=[new_event, held], held=None)
+        return TickPlan(to_send=[outgoing, held], held=None)
 
-    return TickPlan(to_send=[new_event], held=held)
+    return TickPlan(to_send=[outgoing], held=held)
