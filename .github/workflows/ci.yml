@@ -192,8 +192,19 @@ jobs:
       # then confirm the exact expected count landed with none lost and
       # none duplicated. Exits non-zero on any failed check, which fails
       # this step.
+      #
+      # Invoked as `bash scripts/...`, not `./scripts/...`: the script is
+      # tracked with the execute bit set locally, but GitHub's Contents
+      # API (what file-push tooling like this repo's push tool goes
+      # through) always writes blobs at mode 100644 — it has no way to
+      # request 100755 — so a push can silently land the file
+      # non-executable even though `git status` locally shows no change.
+      # `./scripts/...` would then fail with "Permission denied" for a
+      # reason that has nothing to do with the script's own logic.
+      # Running it via `bash` sidesteps the executable bit entirely, so
+      # this step works the same regardless of how the file got here.
       - name: Run the real Postgres crash-recovery proof
-        run: ./scripts/fault_injection_demo.sh
+        run: bash scripts/fault_injection_demo.sh
 
       - name: Compose logs (always, for debugging a failure)
         if: always()
