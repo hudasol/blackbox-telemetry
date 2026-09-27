@@ -151,3 +151,54 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose --profile simulator down -v
+
+  # The one real crash-recovery proof: scripts/fault_injection_demo.sh
+  # SIGKILLs the real postgres container mid-traffic and checks — against
+  # real HTTP responses and a real row count, not a mock — that every
+  # event sent during the outage is still there once postgres comes back
+  # (docs/PLAN.md §4's "Postgres unavailable -> message waits, never
+  # dropped" claim, actually exercised). Until now only pytest's mocked
+  # recovery tests (worker/processing.py's ConnectionError-injection
+  # cases in the `test` job above) ran automatically — a real regression
+  # in crash-recovery timing (e.g. a change to XAUTOCLAIM's idle
+  # threshold, or to the retry backoff) could ship without this script
+  # ever running anywhere but a developer's own machine. Separate job
+  # from docker-smoke above so a fault-injection failure is never masked
+  # by, or blamed on, that job's own unrelated checks.
+  fault-injection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and start the real system
+        run: docker compose up -d --build
+
+      - name: Wait for the api to report ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health/ready > /dev/null; then
+              echo "api is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "api never became ready within 60s"
+          docker compose logs
+          exit 1
+
+      # The script itself does the actual proof: baseline traffic, SIGKILL
+      # postgres, more traffic during the outage (asserting ingest stays
+      # up on 202s — D4: ingest only depends on Redis), restart postgres,
+      # then confirm the exact expected count landed with none lost and
+      # none duplicated. Exits non-zero on any failed check, which fails
+      # this step.
+      - name: Run the real Postgres crash-recovery proof
+        run: ./scripts/fault_injection_demo.sh
+
+      - name: Compose logs (always, for debugging a failure)
+        if: always()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
