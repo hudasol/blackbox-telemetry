@@ -79,7 +79,34 @@ async def run_load(api_base: str, asset_id: str, count: int, concurrency: int) -
             async with semaphore:
                 latencies.append(await send_one(client, api_base, asset_id, seq))
 
-        await asyncio.gather(*(bounded_send(seq) for seq in range(count)))
+        # Not a bare asyncio.gather(...): plain gather propagates the
+        # first exception the moment it happens, without cancelling the
+        # other tasks — they're still mid-`await client.post(...)` when
+        # this `async with` block's __aexit__ then closes the client out
+        # from under them. Each of those in-flight requests then fails
+        # too, but with its own unrelated-looking error (a closed-client
+        # or connection-pool exception) layered on top of the one real
+        # failure, instead of a single clean report of what went wrong.
+        tasks = [asyncio.ensure_future(bounded_send(seq)) for seq in range(count)]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        finally:
+            # Runs whether every task finished cleanly, one raised and
+            # the wait above returned early, or this coroutine itself
+            # got cancelled — either way, make sure every task is
+            # actually done (not just no-longer-pending) before the
+            # `async with` above is allowed to close the client.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        for task in tasks:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                raise exc
 
     return latencies
 
