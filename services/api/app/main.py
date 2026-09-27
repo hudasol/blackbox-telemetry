@@ -25,6 +25,7 @@ from redis.asyncio import Redis
 from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .metrics import INGEST_EVENTS_TOTAL
+from .middleware import MaxBodySizeMiddleware
 from .routers import deadletter, health, ingest, metrics, query, stream
 
 logger = logging.getLogger("api")
@@ -120,6 +121,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("api.shutdown", extra={"event": "api.shutdown"})
 
     app = FastAPI(title="blackbox telemetry api", lifespan=lifespan)
+    # Ahead of everything else: reject an oversized body before a
+    # single route or dependency (including TelemetryEvent's own
+    # extra="allow" parsing) ever sees it. See middleware.py.
+    app.add_middleware(
+        MaxBodySizeMiddleware, max_bytes=settings.max_request_body_bytes
+    )
     app.include_router(ingest.router)
     app.include_router(query.router)
     app.include_router(health.router)

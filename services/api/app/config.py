@@ -25,6 +25,16 @@ class Settings:
     # How long since asset_state.last_seen_at before an asset reads as
     # offline — computed at read time, never stored (docs/PLAN.md, D3).
     asset_offline_timeout_seconds: float = float(DEFAULT_ASSET_OFFLINE_TIMEOUT_SECONDS)
+    # POST /api/v1/telemetry is the one public write endpoint, and
+    # TelemetryEvent's extra="allow" (telemetry_contract/models.py)
+    # means the model itself has no opinion on how large the body is —
+    # a request is fully buffered and parsed before Pydantic ever gets
+    # to reject anything. This is enforced by MaxBodySizeMiddleware
+    # (app/middleware.py), mounted in main.py, well above a real
+    # event's size (a few hundred bytes even with generous extra
+    # fields) but far below anything that could meaningfully pressure
+    # process memory.
+    max_request_body_bytes: int = 64 * 1024
 
 
 def get_settings() -> Settings:
@@ -38,5 +48,8 @@ def get_settings() -> Settings:
             os.environ.get(
                 "ASSET_OFFLINE_TIMEOUT_SECONDS", DEFAULT_ASSET_OFFLINE_TIMEOUT_SECONDS
             )
+        ),
+        max_request_body_bytes=int(
+            os.environ.get("MAX_REQUEST_BODY_BYTES", 64 * 1024)
         ),
     )

@@ -142,6 +142,40 @@ def test_duplicate_event_is_enqueued_both_times(client, redis_conn):
     assert redis_conn.xlen(STREAM_NAME) == 2
 
 
+def test_oversized_body_is_rejected_with_413_and_never_enqueued(redis_conn):
+    # extra="allow" (telemetry_contract/models.py) means a big padding
+    # field is a perfectly valid TelemetryEvent by shape — nothing in
+    # the model itself would ever reject this. Only the size middleware
+    # in front of it does, and it must do so before anything reaches
+    # Redis (docs/PLAN.md, failure policy: never pretend a rejected
+    # request was accepted).
+    app = create_app(
+        Settings(redis_url=REDIS_TEST_URL, log_level="WARNING", max_request_body_bytes=256)
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/telemetry", json=valid_payload(padding="x" * 2000)
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "payload_too_large"
+    assert redis_conn.xlen(STREAM_NAME) == 0
+
+
+def test_body_within_the_configured_limit_is_still_accepted(redis_conn):
+    # A real (unpadded) event is a few hundred bytes — 2048 leaves
+    # comfortable room for it without approaching the 2000-byte padding
+    # used above to trip the limit.
+    app = create_app(
+        Settings(redis_url=REDIS_TEST_URL, log_level="WARNING", max_request_body_bytes=2048)
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/v1/telemetry", json=valid_payload())
+
+    assert response.status_code == 202
+    assert redis_conn.xlen(STREAM_NAME) == 1
+
+
 def test_redis_unavailable_returns_503_and_never_pretends_success(redis_conn):
     app = create_app(Settings(redis_url=UNREACHABLE_REDIS_URL, log_level="WARNING"))
     with TestClient(app) as client:
