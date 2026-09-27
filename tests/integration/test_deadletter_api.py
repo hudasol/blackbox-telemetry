@@ -15,6 +15,7 @@ import pytest
 import pytest_asyncio
 from app.config import Settings
 from app.main import create_app
+from prometheus_client import REGISTRY
 from redis.asyncio import Redis as AsyncRedis
 from telemetry_contract import DEADLETTER_STREAM_NAME, STREAM_NAME
 
@@ -127,6 +128,29 @@ async def test_replay_puts_the_message_back_on_telemetry_raw_and_removes_it(
     # ...and no longer sitting in the dead-letter stream, so the list only
     # ever shows what's still actually outstanding.
     assert await redis_client.xrange(DEADLETTER_STREAM_NAME) == []
+
+
+async def test_replay_increments_the_ingest_events_replayed_counter(api_client, redis_client):
+    # The bug this closes: replay's XADD (inside _REPLAY_SCRIPT) put a
+    # real message onto telemetry.raw without ever touching
+    # blackbox_ingest_events_total — the same metric POST
+    # /api/v1/telemetry increments on every accepted event — so a
+    # dashboard built on it understated real traffic reaching the queue
+    # by however much replay volume there was. Same delta-based
+    # assertion style as test_metrics.py, since the counter is a
+    # process-global shared across the whole test run.
+    before = REGISTRY.get_sample_value(
+        "blackbox_ingest_events_total", {"outcome": "replayed"}
+    ) or 0.0
+
+    entry_id = await _add_deadletter_entry(redis_client, original_seq="9")
+    response = await api_client.post(f"/api/v1/deadletter/{entry_id}/replay")
+    assert response.status_code == 200
+
+    after = REGISTRY.get_sample_value(
+        "blackbox_ingest_events_total", {"outcome": "replayed"}
+    ) or 0.0
+    assert after == before + 1
 
 
 async def test_replay_of_unknown_id_is_404(api_client):

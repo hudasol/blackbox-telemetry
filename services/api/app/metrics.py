@@ -19,11 +19,19 @@ from prometheus_client import Counter, Histogram
 # Answers "is ingest actually accepting traffic, and is it rejecting for a
 # validation reason (client's fault) or a queue-unavailable reason (this
 # system's fault)?" — the three outcomes ingest.py and the 422 handler in
-# main.py can produce.
+# main.py can produce, plus "replayed" (api/routers/deadletter.py): a
+# dead-letter replay's XADD lands on telemetry.raw exactly like a fresh
+# POST /api/v1/telemetry does, so it counts as real traffic reaching the
+# queue too — without this label, replayed volume was invisible here,
+# understating how much traffic telemetry.raw actually received. Kept as
+# its own outcome rather than folded into "accepted" so a dashboard can
+# still see how much current traffic is fresh ingest vs. replay noise,
+# while `sum(rate(...{outcome=~"accepted|replayed"}))` answers "how much
+# reached the queue overall".
 INGEST_EVENTS_TOTAL = Counter(
     "blackbox_ingest_events_total",
-    "Telemetry events handled by POST /api/v1/telemetry, by outcome",
-    ["outcome"],  # accepted | rejected | queue_unavailable
+    "Telemetry events reaching the ingest pipeline, by outcome",
+    ["outcome"],  # accepted | rejected | queue_unavailable | replayed
 )
 
 # Answers "how long does one XADD round-trip actually take, under real

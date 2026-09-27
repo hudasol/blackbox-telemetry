@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 from telemetry_contract import DEADLETTER_STREAM_NAME, STREAM_NAME
 
+from ..metrics import INGEST_EVENTS_TOTAL
+
 router = APIRouter(prefix="/api/v1/deadletter", tags=["deadletter"])
 logger = logging.getLogger("api.deadletter")
 
@@ -194,6 +196,13 @@ async def replay_deadletter(deadletter_id: str, request: Request):
         )
 
     new_stream_id, original_message_id = result
+    # The script's XADD above just put a real message onto telemetry.raw
+    # — the same queue POST /api/v1/telemetry writes to — so it's real
+    # traffic reaching the pipeline, not something separate from what
+    # blackbox_ingest_events_total is meant to answer for. See that
+    # metric's own comment (app/metrics.py) for why this is its own
+    # "replayed" outcome rather than counted as "accepted".
+    INGEST_EVENTS_TOTAL.labels(outcome="replayed").inc()
     logger.info(
         "deadletter.replayed",
         extra={
