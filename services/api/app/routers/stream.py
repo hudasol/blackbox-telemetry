@@ -66,9 +66,18 @@ async def _event_source(request: Request, redis, asset_id: str | None):
             data = message["data"]
             if asset_id is not None:
                 try:
-                    if json.loads(data).get("asset_id") != asset_id:
-                        continue
+                    parsed = json.loads(data)
                 except json.JSONDecodeError:
+                    continue
+                # publish_state_update (worker/redis_stream.py) only ever
+                # publishes a JSON object — but this channel is a plain
+                # Redis Pub/Sub topic, not something this router controls
+                # end to end, so a non-object payload (a bare number,
+                # string, list, or null all parse as valid JSON) must be
+                # skipped like any other message that isn't this asset's,
+                # not blow up the subscriber with an AttributeError from
+                # calling .get() on something that isn't a dict.
+                if not isinstance(parsed, dict) or parsed.get("asset_id") != asset_id:
                     continue
             yield f"data: {data}\n\n"
     finally:

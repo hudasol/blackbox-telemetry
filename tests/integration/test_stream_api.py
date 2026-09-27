@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timezone
 
 from app.routers.stream import _event_source
-from telemetry_contract import TelemetryEvent
+from telemetry_contract import STATE_UPDATE_CHANNEL_NAME, TelemetryEvent
 from worker.processing import process_message
 from worker.redis_stream import ensure_consumer_group
 
@@ -120,6 +120,28 @@ async def test_asset_id_filter_only_forwards_the_matching_asset(pg_pool, redis_c
 
     received = await asyncio.wait_for(task, timeout=READ_TIMEOUT_SECONDS)
     assert received["asset_id"] == "rover-01"
+
+
+async def test_non_object_payload_is_skipped_not_a_crash(pg_pool, redis_client):
+    # Regression test: only json.JSONDecodeError was caught around the
+    # asset_id filter's .get() call — valid JSON that isn't an object
+    # (a bare number, string, list, or null all parse fine) raised an
+    # uncaught AttributeError instead, killing the whole SSE generator
+    # for every subscriber filtering by asset_id, not just skipping that
+    # one message. publish_state_update only ever publishes an object in
+    # practice, so this is exercised directly against a real subscriber
+    # rather than relying on the worker to (accidentally) publish
+    # something malformed.
+    task = asyncio.ensure_future(_first_event(redis_client, asset_id="drone-03"))
+    await asyncio.sleep(SUBSCRIBE_SETTLE_SECONDS)
+
+    await redis_client.publish(STATE_UPDATE_CHANNEL_NAME, "42")
+    await redis_client.publish(STATE_UPDATE_CHANNEL_NAME, "null")
+    await redis_client.publish(STATE_UPDATE_CHANNEL_NAME, '["not", "an", "object"]')
+    await _store_via_worker(pg_pool, redis_client, asset_id="drone-03", seq=1)
+
+    received = await asyncio.wait_for(task, timeout=READ_TIMEOUT_SECONDS)
+    assert received["asset_id"] == "drone-03"
 
 
 async def test_stale_event_is_still_published_with_its_real_outcome(pg_pool, redis_client):
