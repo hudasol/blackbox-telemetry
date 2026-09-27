@@ -27,6 +27,22 @@ logger = logging.getLogger("worker")
 
 # A message idle (read but unacked) longer than this is assumed abandoned
 # by a dead consumer, not just slow — reclaimed regardless of who read it.
+#
+# "Reclaimed" here only means Redis reassigns which consumer owns the
+# Pending Entries List entry — it says nothing about whether the
+# original consumer is actually dead, just that it's been this long
+# since the message was last touched. With one replica that
+# distinction never matters. With more than one (this module's
+# read/reclaim loop is written to run under --scale worker=N), a
+# message can still be idle from Redis's point of view purely because
+# it's mid-retry with backoff (processing.py's own store-retry loop has
+# no attempt limit) while the worker holding it is very much alive —
+# so a second replica's claim_stale_pending below can legitimately
+# reclaim it and start processing the same message a second time. What
+# actually prevents that double-processing is the per-message lock in
+# processing.py/redis_stream.py (acquire_message_lock and friends), not
+# this threshold — this threshold only decides when a reclaim is even
+# attempted.
 CLAIM_MIN_IDLE_MS = 30_000
 READ_BLOCK_MS = 5_000
 

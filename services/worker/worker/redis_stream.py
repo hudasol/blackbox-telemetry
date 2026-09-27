@@ -20,6 +20,97 @@ from telemetry_contract import (
 
 logger = logging.getLogger("worker.stream")
 
+# A per-message advisory lock (worker/processing.py) so a second worker
+# replica can never run db.store_event for a message that another
+# replica is still actively retrying — see acquire_message_lock's own
+# docstring for the failure mode this closes.
+MESSAGE_LOCK_PREFIX = "worker:lock:"
+
+
+def _message_lock_key(message_id: str) -> str:
+    return f"{MESSAGE_LOCK_PREFIX}{message_id}"
+
+
+# Compare-and-extend / compare-and-delete: both only act if the calling
+# attempt still holds the lock (its token still matches what's stored),
+# so a worker whose lock already expired and was picked up by someone
+# else can never stomp on that new owner's lock by extending or
+# releasing it out from under them. Single EVAL is atomic on the Redis
+# server, so there's no separate GET-then-EXPIRE/DEL race either.
+_EXTEND_LOCK_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+_RELEASE_LOCK_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+async def acquire_message_lock(
+    redis: Redis, message_id: str, token: str, ttl_seconds: int
+) -> bool:
+    """True if this attempt now owns the lock for message_id, False if
+    another attempt (this replica or another) already holds it.
+
+    Redis Streams' own idle-time bookkeeping (claim_stale_pending,
+    XAUTOCLAIM) only knows "how long since this message was last
+    delivered or claimed" — it has no idea whether the consumer that's
+    holding it is alive and still working, just slow. With more than
+    one worker replica (worker/main.py's own docstring anticipates
+    --scale worker=N), a message that's mid-retry with backoff (worker
+    processing.py's own store-retry loop, up to BACKOFF_MAX_SECONDS
+    between attempts, with no bound on how many attempts) can sit idle
+    from Redis's point of view for longer than CLAIM_MIN_IDLE_MS even
+    though the original worker is still alive and will eventually
+    succeed — at which point a second replica's claim_stale_pending
+    legitimately reclaims it (Redis itself has no way to know better)
+    and starts processing the same message a second time, concurrently.
+
+    This lock is what actually decides "is anyone already working on
+    this" independently of Streams' idle-time heuristic: the first
+    attempt to acquire it wins and keeps renewing it (see
+    extend_message_lock) for as long as it's actively retrying: a
+    second attempt — whether it's a genuinely new delivery or a
+    XAUTOCLAIM reclaim racing a still-live retry — simply fails to
+    acquire it and backs off without touching the database or acking,
+    leaving the message for the original owner to finish.
+    """
+    return bool(
+        await redis.set(_message_lock_key(message_id), token, nx=True, ex=ttl_seconds)
+    )
+
+
+async def extend_message_lock(
+    redis: Redis, message_id: str, token: str, ttl_seconds: int
+) -> bool:
+    """Keep the lock alive for another ttl_seconds, but only if `token`
+    is still the current holder. Called once per retry attempt (before
+    the backoff sleep) so a worker that's genuinely still alive and
+    retrying never loses its lock to a reclaim mid-backoff; a worker
+    that crashed simply stops renewing, and the lock expires on its own
+    (belt-and-braces recovery — a dead worker's message is never stuck
+    forever, just delayed by up to ttl_seconds beyond when Streams
+    itself would have made it eligible for reclaim)."""
+    result = await redis.eval(
+        _EXTEND_LOCK_SCRIPT, 1, _message_lock_key(message_id), token, ttl_seconds
+    )
+    return bool(result)
+
+
+async def release_message_lock(redis: Redis, message_id: str, token: str) -> None:
+    """Best-effort early release once a message is fully processed
+    (stored-and-acked, or dead-lettered-and-acked), so the lock doesn't
+    sit around for the rest of its TTL doing nothing. Not required for
+    correctness — the TTL alone guarantees the lock eventually frees
+    itself — just tidiness."""
+    await redis.eval(_RELEASE_LOCK_SCRIPT, 1, _message_lock_key(message_id), token)
+
 
 async def ensure_consumer_group(redis: Redis) -> None:
     """Create the consumer group at the start of the stream if it doesn't

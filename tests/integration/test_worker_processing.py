@@ -13,7 +13,12 @@ import pytest
 from telemetry_contract import DEADLETTER_STREAM_NAME, STREAM_NAME, TelemetryEvent
 from worker import db
 from worker.processing import process_message
-from worker.redis_stream import ensure_consumer_group
+from worker.redis_stream import (
+    acquire_message_lock,
+    ensure_consumer_group,
+    extend_message_lock,
+    release_message_lock,
+)
 
 
 def valid_payload(**overrides: object) -> dict:
@@ -257,6 +262,90 @@ async def test_store_time_value_error_is_deadlettered_not_retried_forever(
     deadlettered = await redis_client.xrange(DEADLETTER_STREAM_NAME)
     assert len(deadlettered) == 1
     assert deadlettered[0][1]["original_message_id"] == message_id
+
+
+async def test_acquire_message_lock_is_exclusive(redis_client):
+    first = await acquire_message_lock(redis_client, "msg-1", "token-a", 5)
+    second = await acquire_message_lock(redis_client, "msg-1", "token-b", 5)
+    assert first is True
+    assert second is False  # already held by token-a
+
+
+async def test_extend_message_lock_only_succeeds_for_the_current_holder(redis_client):
+    await acquire_message_lock(redis_client, "msg-1", "token-a", 5)
+    assert await extend_message_lock(redis_client, "msg-1", "token-a", 5) is True
+    # A different token (a different attempt — its own lock has since
+    # expired and someone else's is live, or it never held one at all)
+    # must never be able to extend someone else's lock.
+    assert await extend_message_lock(redis_client, "msg-1", "wrong-token", 5) is False
+
+
+async def test_release_message_lock_only_succeeds_for_the_current_holder(redis_client):
+    await acquire_message_lock(redis_client, "msg-1", "token-a", 5)
+
+    await release_message_lock(redis_client, "msg-1", "wrong-token")
+    assert await acquire_message_lock(redis_client, "msg-1", "token-b", 5) is False  # still held
+
+    await release_message_lock(redis_client, "msg-1", "token-a")
+    assert await acquire_message_lock(redis_client, "msg-1", "token-c", 5) is True  # now free
+
+
+async def test_expired_message_lock_can_be_reacquired(redis_client):
+    await acquire_message_lock(redis_client, "msg-1", "token-a", 1)
+    await asyncio.sleep(1.2)
+    assert await acquire_message_lock(redis_client, "msg-1", "token-b", 5) is True
+
+
+async def test_concurrent_processing_by_two_replicas_only_stores_once(
+    pg_pool, redis_client, monkeypatch
+):
+    """The bug this closes: claim_stale_pending's idle-time threshold
+    (worker/main.py's CLAIM_MIN_IDLE_MS) has no way to know a message
+    is still being actively retried by another worker replica — with
+    more than one replica running (worker/main.py's own comments
+    anticipate --scale worker=N), a second replica's XAUTOCLAIM can
+    legitimately reclaim the exact same message mid-retry and start
+    processing it too. Simulated here by calling process_message twice,
+    concurrently, for the identical message_id/fields — the shape both
+    a genuinely-slow first attempt and a same-message reclaim produce.
+    Only the winner should ever reach db.store_event; the other must
+    back off untouched, not race it."""
+    await enqueue(redis_client, seq=1)
+    message_id, fields = await read_one(redis_client)
+
+    real_store_event = db.store_event
+    call_count = 0
+
+    async def slow_store_event(pool, event, received_at):
+        nonlocal call_count
+        call_count += 1
+        # Held open long enough that both concurrent process_message
+        # calls are guaranteed to have already reached this point (or
+        # be blocked before it, contending on the lock) — proving the
+        # lock, not scheduling luck, is what keeps the loser out.
+        await asyncio.sleep(0.05)
+        return await real_store_event(pool, event, received_at)
+
+    monkeypatch.setattr(db, "store_event", slow_store_event)
+
+    await asyncio.gather(
+        process_message(redis_client, pg_pool, message_id, fields, asyncio.Event()),
+        process_message(redis_client, pg_pool, message_id, fields, asyncio.Event()),
+    )
+
+    assert call_count == 1  # the losing attempt never reached db.store_event at all
+
+    count = await pg_pool.fetchval(
+        "SELECT count(*) FROM telemetry_events WHERE asset_id = $1 AND seq = $2",
+        "drone-01",
+        1,
+    )
+    assert count == 1
+
+    pending = await redis_client.xpending(STREAM_NAME, "worker-group")
+    assert pending["pending"] == 0  # the winner acked it; the loser never touched it
+
+    assert await redis_client.xrange(DEADLETTER_STREAM_NAME) == []
 
 
 async def test_duplicate_message_is_acked_without_a_second_row(pg_pool, redis_client):
