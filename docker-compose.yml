@@ -18,14 +18,26 @@
 # endpoint list). Copy .env.example to .env to override the simulator's
 # fault rates, the offline timeout, etc. — see that file for what's
 # tunable and why.
+#
+# Postgres credentials (POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB) are
+# one override point each, via .env — every place below that needs one
+# reads the same ${VAR:-default}, rather than each spelling out its own
+# copy of the literal value. Changing a credential used to mean editing
+# three separate hardcoded strings (the postgres service's own env, and
+# each of api's/worker's POSTGRES_DSN) with nothing tying them together
+# — missing one didn't fail until whichever service still had the old
+# value tried to authenticate at runtime, not when `docker compose
+# config` or `up` parsed this file. One override point removes the
+# "missed one of three" failure mode entirely: there's only one place
+# each credential is ever written, so there's nothing left to miss.
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: blackbox
-      POSTGRES_PASSWORD: blackbox
-      POSTGRES_DB: blackbox
+      POSTGRES_USER: ${POSTGRES_USER:-blackbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-blackbox}
+      POSTGRES_DB: ${POSTGRES_DB:-blackbox}
     # Host port shifted to 5433 — 5432 is commonly already taken by a
     # local Postgres install (it was, in this sandbox). Services inside
     # compose always reach this one at postgres:5432 regardless.
@@ -34,7 +46,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U blackbox -d blackbox"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-blackbox} -d ${POSTGRES_DB:-blackbox}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -57,7 +69,7 @@ services:
       dockerfile: services/api/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
-      POSTGRES_DSN: postgresql://blackbox:blackbox@postgres:5432/blackbox
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-blackbox}:${POSTGRES_PASSWORD:-blackbox}@postgres:5432/${POSTGRES_DB:-blackbox}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ASSET_OFFLINE_TIMEOUT_SECONDS: ${ASSET_OFFLINE_TIMEOUT_SECONDS:-10}
     ports:
@@ -81,7 +93,7 @@ services:
       dockerfile: services/worker/Dockerfile
     environment:
       REDIS_URL: redis://redis:6379/0
-      POSTGRES_DSN: postgresql://blackbox:blackbox@postgres:5432/blackbox
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-blackbox}:${POSTGRES_PASSWORD:-blackbox}@postgres:5432/${POSTGRES_DB:-blackbox}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # Left unset on purpose: defaults to the container's own hostname
       # (worker/config.py) — fine for D5's "one active worker for now",
