@@ -727,8 +727,8 @@ Straightforward to build since it reuses Redis Streams primitives
 with `pytest` (11 new/extended tests) and then live against the running
 stack: hand-crafted a bad `XADD`, confirmed it showed up in
 `GET .../deadletter` with the real parse-error reason, replayed it, and
-watched it get dead-lettered *again* (still literally `"not valid
-json"` — replay doesn't fix content, it just gives it another chance) —
+watched it get dead-lettered *again* (still literally "not valid
+json" — replay doesn't fix content, it just gives it another chance) —
 kept that honest outcome in `docs/IMPROVEMENTS.md` rather than replaying
 something pre-fixed to make the demo look cleaner.
 
@@ -841,3 +841,112 @@ count); `docker-compose.yml` (worker's `9100` metrics port exposed);
 both `services/api/pyproject.toml` and `services/worker/pyproject.toml`
 (`prometheus-client` added as a real declared dependency, not just
 installed ad hoc in the dev venv).
+
+## 2026-09-27 — 2026-09-28 — Adversarial review: 13 findings, all fixed
+
+Asked for a fresh adversarial review of the whole repo before tagging
+`v1.0.0` — not a re-read of `docs/PLAN.md`'s own claims, but someone
+trying to break the system's stated guarantees. It found 13 real
+issues (3 critical, 5 significant, 5 minor), none previously caught by
+the test suite or the acceptance-check verification above. Fixed all
+13, each with its own commit, its own regression test where the code
+path was testable by pytest, and re-verified against real Postgres +
+Redis before moving to the next one — never batched untested.
+
+**Critical (all three were "the system lies about its own
+guarantees" bugs, not edge-case polish):**
+- A NUL byte in `asset_id`, or NaN/Infinity hidden in an `extra=allow`
+  field, passed contract validation untouched and then crashed the
+  worker permanently at the Postgres write — the same bytes fail the
+  same way on every retry, so one bad event could wedge the queue
+  forever. Fixed by rejecting both at the contract layer (recursively,
+  including nested objects/lists), plus a worker-side backstop in case
+  something reaches `store_event` anyway.
+- Dead-letter replay's lookup/re-enqueue/delete were three separate
+  Redis round-trips with nothing tying them together — a Redis blip
+  between them, or two replay requests for the same id at once, could
+  duplicate or silently drop a message. Fixed by making all three one
+  atomic Lua script.
+- A malformed replay id raised a Redis `ResponseError` (a `RedisError`
+  subclass), which the router reported as `503 queue_unavailable` —
+  indistinguishable from a real outage to anything watching that status
+  code. Fixed by catching that specific case and returning `400`.
+
+**Significant:**
+- No body-size limit on `POST /api/v1/telemetry` — a single oversized
+  or deeply nested payload was fully buffered and parsed before
+  validation ever ran. Fixed with ASGI middleware enforcing a
+  configurable byte cap, checked against `Content-Length` and against
+  actual bytes read (so a chunked body without `Content-Length` can't
+  bypass it), before FastAPI's own parsing starts.
+- Two worker replicas could both claim and process the same message —
+  `XAUTOCLAIM`'s idle threshold doesn't know a message is still being
+  retried by a live worker. Fixed with a per-message Redis lock
+  (acquire/extend/release, all exclusive to the current holder).
+- Concurrent replay of the same dead-letter id wasn't locked — closed
+  by the same atomic Lua script as the critical dead-letter fix above.
+- `plan_tick`'s `should_corrupt()` short-circuited `should_reorder()`,
+  so the out-of-order rate was quietly lower than `SIM_OUT_OF_ORDER_RATE`
+  says whenever bad-data injection also fired on the same tick. Fixed
+  by computing both independently. Verified with a statistical
+  regression test (4,000 simulated ticks, both rates non-zero) checking
+  the observed reorder rate lands within tolerance of the configured
+  one — a plain before/after read wouldn't have caught a rate drifting
+  by degree rather than breaking outright.
+- `scripts/fault_injection_demo.sh` (the one real Postgres
+  crash-recovery proof) was never called by CI — only pytest's mocked
+  recovery tests ran automatically. Added a dedicated `fault-injection`
+  CI job that runs it against a real `docker compose up` stack on every
+  push.
+
+**Minor:**
+- Dead-letter replay never touched `blackbox_ingest_events_total`, so
+  replayed volume understated real traffic reaching `telemetry.raw`.
+  Fixed with a new `outcome="replayed"` label.
+- The SSE stream's asset_id filter only caught `json.JSONDecodeError`;
+  valid JSON that isn't an object (a bare number, string, list, or
+  null) raised an uncaught `AttributeError` instead, which would have
+  killed the generator for every filtered subscriber. Unreachable
+  today (the worker only ever publishes objects) but fixed anyway —
+  wrong input from *anything* on that channel should be skipped, not
+  crash the reader.
+- Postgres credentials were three separate hardcoded strings in
+  `docker-compose.yml` with nothing tying them together — missing one
+  during a credential change failed at runtime, not at parse time.
+  Fixed with a single `${POSTGRES_*:-default}` override point read
+  everywhere a credential is needed.
+- `scripts/load_test.py` used a bare `asyncio.gather` — the first
+  failure propagated immediately without cancelling sibling tasks, so
+  the `async with client:` block closed the client out from under
+  requests still in flight. Fixed with explicit tasks +
+  `asyncio.wait(..., return_when=FIRST_EXCEPTION)` + a `finally` block
+  that cancels and awaits every task before the client is allowed to
+  close. Verified with an instrumented mock tracking whether any
+  request was still in-flight at the moment the client closed: 19 of
+  20 concurrent sends were abandoned mid-request with the old code,
+  zero with the fix.
+- Two of `fault_injection_demo.sh`'s three `wait_for` calls relied on
+  `set -e` instead of the script's own `FAILURES` tally, so a slow
+  Postgres restart could abort the script before the one check it
+  exists to make (step 6, zero data loss) ever ran. Fixed with
+  `|| true` on both (the timeout is still recorded via `fail()`
+  either way — only the early exit is avoided).
+
+**A follow-up caught while closing out the last minor finding:** the
+`fault-injection` CI job (added above) ran the script as
+`./scripts/fault_injection_demo.sh`, relying on its executable bit.
+GitHub's Contents API — used by the file-push tooling this build
+relies on — always writes blobs at mode `100644` and has no way to
+request `100755`, so a push could silently land the script
+non-executable on GitHub with the local working tree showing no
+difference at all. No tool available in this environment exposes a
+pushed file's git blob mode, so this couldn't be directly confirmed
+either way. Rather than leave it as an unverified assumption, changed
+the CI step to `run: bash scripts/fault_injection_demo.sh`, which
+doesn't depend on the file's mode bit regardless of how it landed.
+
+Full suite after all 13 fixes: 160 tests passing (up from 123),
+re-run against real Postgres + Redis, not from a stale commit-message
+count. `README.md`'s test count and command were the only
+documentation actually out of date after this round; updated in the
+same pass as this entry.
