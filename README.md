@@ -243,9 +243,11 @@ bring in `pytest`, `pytest-asyncio`, `httpx`):
 pytest tests/ -v
 ```
 
-123 tests, all passing as of this step. If your Postgres/Redis run on
-different ports or credentials, override with `POSTGRES_TEST_DSN` and
-`REDIS_TEST_URL` (defaults are in `tests/integration/conftest.py`):
+160 tests, all passing — re-verified against real Postgres/Redis as of
+the adversarial-review fix round (see `docs/PROCESS_LOG.md`'s last
+entry). If your Postgres/Redis run on different ports or credentials,
+override with `POSTGRES_TEST_DSN` and `REDIS_TEST_URL` (defaults are
+in `tests/integration/conftest.py`):
 
 ```bash
 POSTGRES_TEST_DSN=postgresql://blackbox:blackbox@localhost:5432/blackbox_test \
