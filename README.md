@@ -1,36 +1,109 @@
 # blackbox — fleet telemetry backend
 
-A resilient, reproducible telemetry service for a simulated inspection fleet
-(drone, ground rover, quadruped). No AI/ML/agent logic inside the product —
-this is the systems layer: ingest → queue → worker → persistence → query,
-built to fail predictably instead of quietly.
+[![CI](https://github.com/hudasol/blackbox-telemetry/actions/workflows/ci.yml/badge.svg)](https://github.com/hudasol/blackbox-telemetry/actions/workflows/ci.yml)
+
+Fleets of autonomous assets (drones, rovers, legged robots) report state
+constantly, and a telemetry backend that drops events, double-counts them,
+or goes down because one dependency is slow is worse than useless — it
+actively lies about what the fleet is doing. **blackbox** is a backend for
+exactly that problem: FastAPI ingest → Redis Streams → a crash-safe worker →
+Postgres, where ingest and processing fail and recover independently,
+every accepted event is stored exactly once even under redelivery, and
+per-asset state only ever moves forward. No AI/ML/agent logic inside the
+product — this is the systems layer underneath one.
+
+```mermaid
+flowchart LR
+    SIM["simulators<br/><sub>test equipment, not part of the product</sub><br/>drone-sim · rover-sim · quadruped-sim"]
+    API["api — FastAPI<br/><sub>ingest + query + health</sub>"]
+    STREAM[("redis stream: telemetry.raw<br/><sub>consumer group: worker-group</sub>")]
+    WORKER["worker<br/><sub>idempotent insert · monotonic state<br/>bounded-backoff retry</sub>"]
+    PG[("postgresql<br/><sub>telemetry_events (raw)<br/>asset_state (latest snapshot)</sub>")]
+
+    SIM -- "HTTP POST<br/>/api/v1/telemetry" --> API
+    API -- "XADD" --> STREAM
+    STREAM -- "XREADGROUP<br/>XACK / XAUTOCLAIM" --> WORKER
+    WORKER -- "INSERT / UPSERT" --> PG
+    PG -- "SELECT" --> API
+```
+
+## Key results
+
+Measured against the real, running api + worker + Redis + Postgres — not
+estimated, and re-run fresh for this round rather than reusing older
+numbers (`scripts/load_test.py`, `scripts/fault_injection_demo.sh`; see
+`docs/PROCESS_LOG.md` for the exact run and the one environment note below
+the table).
+
+| Metric | Measured value | How |
+|---|---|---|
+| Ingest throughput | 208 req/s | 500 events, concurrency 50 — `scripts/load_test.py` |
+| Ingest latency p50 / p95 / p99 | 167 ms / 559 ms / 800 ms | same run, per-request wall time |
+| Worker drain rate | 746 events/s | time for the worker to fully clear a 500-event backlog from zero |
+| Recovery time after a Postgres kill | 2.6 s | outage-to-`/health/ready` window, fault-injection proof |
+| Data loss after a Postgres kill | 0 of 16 events | 8 sent before + 8 sent *during* the outage, all 16 stored, none duplicated |
+
+Both scripts normally expect the stack from `docker compose up --build -d`;
+Docker wasn't available in the sandbox this round was run in, so the api
+and worker ran as plain `uvicorn`/`python -m worker.main` processes
+against the same real Postgres and Redis instead — same code, same
+database, different process supervisor. Noted here rather than silently
+reusing an older, Docker-measured number. The worker-crash-and-reclaim
+path (as opposed to Postgres-crash) is proven correct by
+`tests/integration/test_worker_restart_recovery.py`, bounded by
+`CLAIM_MIN_IDLE_MS = 30s` in `services/worker/worker/main.py`, but wasn't
+separately re-timed by a script this round.
 
 Full design, data contract, and failure policy: [`docs/PLAN.md`](docs/PLAN.md).
-Build history, decisions, and every bug found along the way (and how it was
+Design decisions and known limits: [`docs/adr/`](docs/adr/) (below). Build
+history, decisions, and every bug found along the way (and how it was
 found): [`docs/PROCESS_LOG.md`](docs/PROCESS_LOG.md). Five additions beyond
 the baseline — poison-message handling, real observability, automated fault
 injection, a measured performance proof, and a live state stream — each
 tied to a specific engineering risk and backed by a real run, not a
 claim: [`docs/IMPROVEMENTS.md`](docs/IMPROVEMENTS.md). Honest retrospective
-— what went wrong, bad assumptions, and what pre-submission checks
+— what went wrong, bad assumptions, and what my own pre-release checks
 missed: [`docs/RETROSPECTIVE.md`](docs/RETROSPECTIVE.md).
 
-```
-   simulators (test equipment, not part of the product)
-   drone-sim   rover-sim   quadruped-sim
-            |  HTTP POST /api/v1/telemetry
-            v
-   api (FastAPI) — ingest + query + health
-            |  XADD                     ^  SELECT
-            v                            |
-   redis stream: telemetry.raw
-            |  XREADGROUP / XACK / XAUTOCLAIM
-            v
-   worker — idempotent, monotonic-state insert
-            |  INSERT / UPSERT
-            v
-   postgresql — telemetry_events (raw) + asset_state (latest snapshot)
-```
+## Design decisions
+
+The full reasoning, rejected alternatives, and consequences for each of
+these live in [`docs/adr/`](docs/adr/) as short ADRs — this is the
+one-line version of each:
+
+- **Redis Streams, not Kafka or RabbitMQ** — a consumer group's pending-
+  entries list + `XAUTOCLAIM` gives durable, replayable at-least-once
+  delivery as the *default* behavior, with no new infrastructure beyond
+  the Redis this project already runs. ([ADR-0001](docs/adr/0001-redis-streams-over-kafka-rabbitmq.md))
+- **Idempotent inserts + monotonic state, not exactly-once delivery** —
+  `UNIQUE(asset_id, seq)` + `ON CONFLICT DO NOTHING`, and state that only
+  advances on a strictly newer `seq`, make redelivery harmless, which is
+  cheaper than making delivery itself exactly-once. ([ADR-0002](docs/adr/0002-idempotent-inserts-and-monotonic-state.md))
+- **At-least-once delivery, by design** — `XACK` only after commit means
+  a crash between the two causes redelivery, not loss; that's accepted
+  and pushed onto the idempotent insert above rather than solved with a
+  distributed transaction. ([ADR-0003](docs/adr/0003-at-least-once-delivery.md))
+- **Known limits and what changes at 100x scale** — one worker replica,
+  no partitioning, no rate limiting yet, no HA on Redis/Postgres — stated
+  plainly, with the order these would actually need fixing in.
+  ([ADR-0004](docs/adr/0004-known-limits-and-100x-scale.md))
+
+## Failure modes
+
+Every row is backed by a real, passing test — not just a line in a design
+doc.
+
+| Failure | Detection | Behavior | Recovery | Proven by |
+|---|---|---|---|---|
+| Malformed / missing fields | Pydantic validation at ingest | `422`, never enqueued | Caller fixes and resends | `test_missing_required_field_is_rejected_and_not_enqueued` |
+| Duplicate `(asset_id, seq)` | Postgres unique constraint at insert | Enqueued anyway; `ON CONFLICT DO NOTHING` | One row, no error, no retry needed | `test_duplicate_seq_is_not_inserted_twice` |
+| Out-of-order / stale `seq` | incoming `seq` ≤ stored `seq` | Raw event stored for history; `asset_state` not advanced | State only ever moves forward | `test_out_of_order_event_is_stored_but_does_not_regress_state` |
+| Redis unavailable | `XADD` raises at ingest | `503` immediately, never a false `202` | Caller retries once Redis is back | `test_redis_unavailable_returns_503_and_never_pretends_success` |
+| Postgres unavailable | insert raises inside the worker loop | No `XACK`; bounded exponential backoff (0.5s → 30s, ×2), logged per attempt | Message waits in the stream; measured at 2.6s outage-to-ready in this round's live run | `test_db_failure_is_retried_and_not_acked_until_it_succeeds`, plus `scripts/fault_injection_demo.sh` live above |
+| Worker killed before ack, message never stored | left pending in the consumer group, idle past `CLAIM_MIN_IDLE_MS` (30s) | `XAUTOCLAIM` reclaims it for another consumer | Idempotent insert — reclaimed message is processed exactly like a fresh one | `test_message_read_but_never_processed_is_reclaimed_after_crash` |
+| Worker killed after store, before ack | same reclaim path, but the row already exists | Reclaimed and reprocessed | `ON CONFLICT DO NOTHING` makes the retried insert a no-op — no duplicate row | `test_message_already_stored_before_crash_is_recovered_without_duplicating` |
+| Consumer group deleted/flushed mid-run | `NOGROUP` error on the next read | Worker recreates the consumer group instead of retrying forever against a group that no longer exists | Resumes consuming normally | `test_worker_recreates_a_deleted_consumer_group_and_keeps_going` |
+| Message the worker can never parse | parse raises inside processing | Stored in the dead-letter list instead of retried forever or silently dropped | `POST /api/v1/deadletter/{id}/replay` puts it back once fixed | `test_malformed_payload_is_logged_and_acked_not_retried_forever` |
 
 ## Run it (two commands)
 
@@ -223,7 +296,7 @@ Postgres and Redis — never mocks — including the failure cases from
 `docs/PLAN.md` §4 (duplicate events, out-of-order/stale sequences, a
 worker killed mid-stream, Postgres or Redis going unreachable). See
 `docs/PROCESS_LOG.md`'s "Tests" entry for how that coverage was audited
-against the brief's failure table.
+against the documented failure table in `docs/PLAN.md` §4.
 
 Point the suite at a disposable Postgres and Redis on the ports the
 tests default to (matches what CI does in `.github/workflows/ci.yml`):
@@ -244,7 +317,7 @@ pytest tests/ -v
 ```
 
 160 tests, all passing — re-verified against real Postgres/Redis as of
-the adversarial-review fix round (see `docs/PROCESS_LOG.md`'s last
+the critical self-review fix round (see `docs/PROCESS_LOG.md`'s last
 entry). If your Postgres/Redis run on different ports or credentials,
 override with `POSTGRES_TEST_DSN` and `REDIS_TEST_URL` (defaults are
 in `tests/integration/conftest.py`):
@@ -277,5 +350,5 @@ docker-compose.yml          system + simulated fleet (kept as two separate comma
 docs/PLAN.md                design: architecture, contract, failure policy
 docs/PROCESS_LOG.md         running build log — decisions, bugs found, fixes
 docs/IMPROVEMENTS.md        five additions beyond the baseline, each with real-run evidence
-docs/RETROSPECTIVE.md       honest account of mistakes, lessons, and pre-submission gaps
+docs/RETROSPECTIVE.md       honest account of mistakes, lessons, and pre-release gaps
 ```
