@@ -14,7 +14,7 @@ liveness vs. readiness; structured, traceable logs; one-command
 reproducibility.
 
 **Not responsible for:** generating telemetry (simulator is separate test
-equipment); AI/ML/agent logic (excluded by the task); auth; alerting or an
+equipment); AI/ML/agent logic (out of scope for this project); auth; alerting or an
 operator UI beyond curl/OpenAPI; cloud deployment; pre-registering asset
 ids — new assets are discovered from traffic, no schema change needed.
 
@@ -59,7 +59,7 @@ separate so ingest never depends on worker/Postgres health.
 
 ## 3. Data contract
 
-Fields as specified in the brief: `asset_id`, `asset_type`
+Fields in the telemetry contract: `asset_id`, `asset_type`
 (drone|rover|quadruped), `seq` (int, monotonic per asset), `timestamp_utc`,
 `position.{x_m,y_m,z_m}`, `speed_mps`, `heading_deg`, `battery_pct`,
 `temperature_c`, `link_quality_pct`, `mode`.

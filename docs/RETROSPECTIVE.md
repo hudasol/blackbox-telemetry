@@ -172,7 +172,7 @@ doesn't resolve that for you, but it's flagging it rather than letting
   requirements — re-check against the plan itself, not just against what
   that step decided to test for.
 
-## 4. What my own pre-submission checks missed, honestly
+## 4. What my own pre-release checks missed, honestly
 
 - The Docker Compose step's live verification proved the system comes up
   and produces traffic — it never explicitly tested "does *only* the
@@ -190,8 +190,9 @@ doesn't resolve that for you, but it's flagging it rather than letting
   `docker-smoke` CI job, but only after being explicitly asked to check
   it, not as a step that flagged itself as missing.
 - This file didn't exist until asked for directly, and no git tag exists
-  yet either — both are things a "what does a finished submission look
-  like" self-check should have surfaced on its own, and didn't.
+  yet either — both are things a "what does a finished, shippable
+  project look like" self-check should have surfaced on its own, and
+  didn't.
 - A few numeric defaults (the backoff schedule's `0.5s`/`30s`/`2x`, the
   `10s` asset-offline timeout) are reasonable but not independently
   argued for in the repo beyond "it's configurable, not a buried magic
